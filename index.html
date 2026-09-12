@@ -1,0 +1,2499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Rainbow Survivors</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#171922;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;cursor:crosshair;image-rendering:auto}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  "use strict";
+  const c = document.getElementById("game");
+  const ctx = c.getContext("2d");
+  const VW = 1024, VH = 576;
+  let DPR = 1, W = VW, H = VH, viewScale = 1;
+  function resize() {
+    DPR = Math.min(2, devicePixelRatio || 1);
+    viewScale = Math.max(.001, Math.min(innerWidth / VW, innerHeight / VH));
+    c.width = Math.round(VW * DPR);
+    c.height = Math.round(VH * DPR);
+    c.style.width = Math.round(VW * viewScale) + "px";
+    c.style.height = Math.round(VH * viewScale) + "px";
+  }
+  addEventListener("resize", resize);
+  resize();
+  function toView(x, y) {
+    const r = c.getBoundingClientRect();
+    return {
+      x: (x - r.left) / viewScale,
+      y: (y - r.top) / viewScale
+    };
+  }
+  const TAU = Math.PI * 2;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const dist2 = (a, b) => {
+    let x = a.x - b.x, y = a.y - b.y;
+    return x * x + y * y;
+  };
+  const len = (x, y) => Math.hypot(x, y) || 1;
+  function norm(x, y) {
+    let l = len(x, y);
+    return {
+      x: x / l,
+      y: y / l
+    };
+  }
+  function hexA(hex, a) {
+    let n = parseInt(hex.slice(1), 16), r = n >> 16, g = n >> 8 & 255, b = n & 255;
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  function mixHex(a, b, t) {
+    const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+    const f = (sa, sb) => Math.round(lerp(pa >> sa & 255, pb >> sb & 255, clamp(t, 0, 1))).toString(16).padStart(2, "0");
+    return "#" + f(16, 16) + f(8, 8) + f(0, 0);
+  }
+  function angDiff(a, b) {
+    let d = (a - b + Math.PI) % TAU;
+    if (d < 0) d += TAU;
+    return d - Math.PI;
+  }
+  const ISO_X = .78, ISO_Y = .58;
+  let cam = {
+    x: 0,
+    y: 0
+  };
+  function worldToScreen(x, y, z = 0) {
+    const dx = x - cam.x, dy = y - cam.y;
+    return {
+      x: W * .5 + (dx - dy) * ISO_X,
+      y: H * .54 + (dx + dy) * ISO_Y - z
+    };
+  }
+  function screenToWorld(sx, sy) {
+    const X = (sx - W * .5) / ISO_X;
+    const Y = (sy - H * .54) / ISO_Y;
+    return {
+      x: cam.x + (X + Y) * .5,
+      y: cam.y + (Y - X) * .5
+    };
+  }
+  function screenMoveToWorld(sx, sy) {
+    const X = sx / ISO_X, Y = sy / ISO_Y;
+    return norm((X + Y) * .5, (Y - X) * .5);
+  }
+  const COLORS = [ {
+    key: "#ff4258",
+    role: "Damage"
+  }, {
+    key: "#ff8a21",
+    role: "Blast"
+  }, {
+    key: "#ffd83d",
+    role: "Speed"
+  }, {
+    key: "#59d45a",
+    role: "Heal"
+  }, {
+    key: "#39aef1",
+    role: "Slow"
+  }, {
+    key: "#5969e8",
+    role: "Block"
+  }, {
+    key: "#a74ee8",
+    role: "Weaken"
+  } ];
+  const XP_CAP = 16;
+  const BOSS_TIME = 480;
+  const MAP_RADIUS = 1500;
+  const TRASH_DESPAWN = 1500, BOSS_RECALL = 1800;
+  const SPRINT_BOOST = 1.9, SPRINT_MAX = 3.6, SPRINT_ACCEL = .85;
+  const SPRINT_STOP_MIN = 2.4;
+  const SPRINT_REHIT = .8;
+  const KNOCK_RATIO = 5.4;
+  const KNOCK_DECAY = .004;
+  const KNOCK_STOP = 4;
+  const FLASH_D = .22;
+  const SHAKE_MAX = 22;
+  const REGEN_DELAY = 4;
+  const PLAYER_SCALE = 1.3;
+  const MENU_IN = .26, MENU_OUT = .3;
+  let keys = new Set, mouse = {
+    x: 0,
+    y: 0,
+    down: false
+  };
+  let gameTime = 0, dead = false, paused = false, started = false, levelChoices = [], killCount = 0;
+  let enemies = [], projectiles = [], trails = [], pickups = [], bursts = [], floaters = [], props = [], gusts = [], confetti = [];
+  let spawnTimer = 0, bossSpawned = false;
+  let selected = 0;
+  let idCounter = 1;
+  let levelFxStart = -99999;
+  let hitStop = 0, flashT = 0, confettiEmit = 0;
+  let shakeX = 0, shakeY = 0, shakeMag = 0, shakeT = 0, shakeDur = 0, shakePhase = 0;
+  let menuOpenAt = -1, menuCloseAt = -1, menuChosen = -1;
+  const player = {
+    x: 0,
+    y: 0,
+    r: 15,
+    hp: 100,
+    maxHp: 100,
+    speed: 140,
+    faceX: 1,
+    faceY: 0,
+    paint: 100,
+    maxPaint: 100,
+    paintRegen: 7,
+    stamina: 50,
+    maxStamina: 50,
+    staminaDrain: 36,
+    staminaRegen: 9,
+    sprintMult: 1,
+    sprinting: false,
+    sprintBlocked: false,
+    sprintTime: 0,
+    sprintSpeedRatio: 1,
+    sprintMultCur: 1,
+    sprintImpactCd: 0,
+    sprintBurstDamage: 15,
+    sprintDps: 13,
+    _sprintHitAt: new Map,
+    xp: 0,
+    level: 1,
+    xpNext: 18,
+    rainbowLife: 7.5,
+    invuln: 0,
+    hpRegen: 2.5,
+    noHitTime: 0,
+    redDps: 21.6,
+    orangeDamage: 18,
+    yellowBoost: .5,
+    greenHps: 10,
+    blueSlow: .48,
+    violetAmp: .45,
+    indigoHp: 3,
+    magnet: 90,
+    moveAnim: 0,
+    bob: 0,
+    strideAmt: 0,
+    animSpeedMul: 0,
+    visualYaw: 0,
+    sprintVisual: 0,
+    sprintWindTick: 0
+  };
+  function reset() {
+    gameTime = 0;
+    dead = false;
+    bossSpawned = false;
+    paused = false;
+    levelChoices = [];
+    killCount = 0;
+    levelFxStart = -99999;
+    enemies = [];
+    projectiles = [];
+    trails = [];
+    pickups = [];
+    bursts = [];
+    floaters = [];
+    props = [];
+    gusts = [];
+    confetti = [];
+    spawnTimer = 0;
+    selected = 0;
+    currentStroke = null;
+    hitStop = 0;
+    flashT = 0;
+    confettiEmit = 0;
+    shakeX = 0;
+    shakeY = 0;
+    shakeMag = 0;
+    shakeT = 0;
+    shakeDur = 0;
+    shakePhase = 0;
+    menuOpenAt = -1;
+    menuCloseAt = -1;
+    menuChosen = -1;
+    Object.assign(player, {
+      x: 0,
+      y: 0,
+      hp: 100,
+      maxHp: 100,
+      speed: 140,
+      faceX: 1,
+      faceY: 0,
+      paint: 100,
+      maxPaint: 100,
+      paintRegen: 7,
+      stamina: 50,
+      maxStamina: 50,
+      staminaDrain: 36,
+      staminaRegen: 9,
+      sprintMult: 1,
+      sprinting: false,
+      sprintBlocked: false,
+      sprintTime: 0,
+      sprintSpeedRatio: 1,
+      sprintMultCur: 1,
+      sprintImpactCd: 0,
+      sprintBurstDamage: 15,
+      sprintDps: 13,
+      _sprintHitAt: new Map,
+      xp: 0,
+      level: 1,
+      xpNext: 18,
+      rainbowLife: 7.5,
+      invuln: 0,
+      hpRegen: 2.5,
+      noHitTime: 0,
+      redDps: 21.6,
+      orangeDamage: 18,
+      yellowBoost: .5,
+      greenHps: 10,
+      blueSlow: .48,
+      violetAmp: .45,
+      indigoHp: 3,
+      magnet: 90,
+      moveAnim: 0,
+      bob: 0,
+      strideAmt: 0,
+      animSpeedMul: 0,
+      visualYaw: 0,
+      sprintVisual: 0,
+      sprintWindTick: 0
+    });
+    cam.x = cam.y = 0;
+    props = [];
+    for (let i = 0; i < 320; i++) {
+      let o, tries = 0;
+      do {
+        o = makeProp(rnd(-1600, 1600), rnd(-1600, 1600));
+        tries++;
+      } while (propColliderRadius(o) > 0 && o.x * o.x + o.y * o.y < 110 * 110 && tries < 20);
+      props.push(o);
+    }
+    for (let i = 0; i < 6; i++) spawnEnemy();
+  }
+  function makeProp(x, y) {
+    let t = Math.random(), type = t < .48 ? "grass" : t < .72 ? "rock" : t < .92 ? "bush" : "tree";
+    return {
+      x,
+      y,
+      type,
+      s: rnd(.85, 1.8),
+      rot: rnd(0, TAU)
+    };
+  }
+  function propColliderRadius(o) {
+    return o.type === "rock" ? 14.5 * o.s : o.type === "tree" ? 9 * o.s : 0;
+  }
+  function resolvePropCollisions(e) {
+    for (const o of props) {
+      const or = propColliderRadius(o);
+      if (or <= 0) continue;
+      const dx = e.x - o.x, dy = e.y - o.y, min = e.r + or, d2 = dx * dx + dy * dy;
+      if (d2 >= min * min) continue;
+      if (d2 < 1e-4) {
+        e.x += min;
+        e.y += .01;
+        continue;
+      }
+      const d = Math.sqrt(d2), push = min - d;
+      e.x += dx / d * push;
+      e.y += dy / d * push;
+    }
+  }
+  addEventListener("keydown", e => {
+    keys.add(e.code);
+    if (e.code === "Space") e.preventDefault();
+    if (started && e.code === "KeyR") reset();
+    if (paused && /^Digit[123]$/.test(e.code)) {
+      chooseUpgrade(+e.code.slice(5) - 1);
+    } else if (started && e.code.startsWith("Digit")) {
+      let n = +e.code.slice(5);
+      if (n >= 1 && n <= 7) selected = n - 1;
+    }
+  });
+  addEventListener("keyup", e => {
+    keys.delete(e.code);
+    if (e.code === "Space") player.sprintBlocked = false;
+  });
+  c.addEventListener("pointermove", e => {
+    const p = toView(e.clientX, e.clientY);
+    mouse.x = p.x;
+    mouse.y = p.y;
+  });
+  c.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    if (!started) {
+      started = true;
+      return;
+    }
+    if (!paused && !dead) {
+      const p = toView(e.clientX, e.clientY);
+      mouse.x = p.x;
+      mouse.y = p.y;
+      mouse.down = true;
+      beginStroke();
+    }
+  });
+  addEventListener("pointerup", e => {
+    if (e.button === 0) {
+      mouse.down = false;
+      endStroke();
+    }
+  });
+  c.addEventListener("wheel", e => {
+    e.preventDefault();
+    if (started) selected = (selected + (e.deltaY > 0 ? 1 : 6)) % 7;
+  }, {
+    passive: false
+  });
+  let currentStroke = null;
+  function beginStroke() {
+    if (player.paint <= 0) return;
+    const p = screenToWorld(mouse.x, mouse.y);
+    currentStroke = {
+      color: selected,
+      points: [ p ],
+      life: player.rainbowLife,
+      exploded: false
+    };
+    if (selected === 5) {
+      currentStroke.blockHp = [];
+      currentStroke.segBlock = [];
+      currentStroke.blockMax = player.indigoHp;
+      currentStroke.blockAcc = 0;
+    }
+    trails.push(currentStroke);
+  }
+  function endStroke() {
+    if (currentStroke && currentStroke.color === 1 && currentStroke.points.length > 1) blastOrange(currentStroke);
+    currentStroke = null;
+  }
+  function addStrokePoint() {
+    if (!mouse.down || !currentStroke || paused || dead) return;
+    if (player.paint <= 0) {
+      player.paint = 0;
+      endStroke();
+      return;
+    }
+    const p = screenToWorld(mouse.x, mouse.y), a = currentStroke.points[currentStroke.points.length - 1];
+    const d = Math.hypot(p.x - a.x, p.y - a.y);
+    if (d < 7) return;
+    const COST_PER_UNIT = .045;
+    const drawable = Math.min(d, player.paint / COST_PER_UNIT);
+    if (drawable <= 0) {
+      player.paint = 0;
+      endStroke();
+      return;
+    }
+    const tEnd = drawable / d;
+    const target = {
+      x: lerp(a.x, p.x, tEnd),
+      y: lerp(a.y, p.y, tEnd)
+    };
+    const step = Math.min(drawable, 18), n = Math.max(1, Math.ceil(drawable / step));
+    let prev = a;
+    for (let i = 1; i <= n; i++) {
+      const q = {
+        x: lerp(a.x, target.x, i / n),
+        y: lerp(a.y, target.y, i / n)
+      };
+      currentStroke.points.push(q);
+      const segLen = Math.hypot(q.x - prev.x, q.y - prev.y);
+      if (currentStroke.segBlock) indigoAddSegment(currentStroke, segLen);
+      prev = q;
+    }
+    player.paint = Math.max(0, player.paint - drawable * COST_PER_UNIT);
+    if (drawable < d || player.paint <= 1e-4) {
+      player.paint = 0;
+      endStroke();
+    }
+  }
+  function blastOrange(t) {
+    if (t.exploded) return;
+    t.exploded = true;
+    const hitCounts = new Map, falloff = [ 1, .75, .55, .4 ];
+    for (let i = 0; i < t.points.length; i += 2) {
+      const p = t.points[i];
+      bursts.push({
+        x: p.x,
+        y: p.y,
+        r: 4,
+        maxR: 52,
+        t: 0,
+        d: .34,
+        color: COLORS[1].key
+      });
+      for (const e of [ ...enemies ]) {
+        const rr = 44 + e.r;
+        if ((e.x - p.x) ** 2 + (e.y - p.y) ** 2 < rr * rr) {
+          const hits = hitCounts.get(e.id) || 0;
+          const mult = hits < falloff.length ? falloff[hits] : .25;
+          hitCounts.set(e.id, hits + 1);
+          damageEnemy(e, player.orangeDamage * .28 * mult, true);
+        }
+      }
+    }
+  }
+  const INDIGO_BLOCK = 60;
+  function indigoAddSegment(t, segLen) {
+    if (!t.blockHp.length || t.blockAcc + segLen > INDIGO_BLOCK) {
+      t.blockHp.push(t.blockMax);
+      t.blockAcc = 0;
+    }
+    t.blockAcc += segLen;
+    t.segBlock.push(t.blockHp.length - 1);
+  }
+  function indigoSegHp(t, i) {
+    return t.segBlock ? t.blockHp[t.segBlock[i]] : 0;
+  }
+  function indigoHitBlock(x, y, t, rad) {
+    if (!t.segBlock) return -1;
+    const pts = t.points;
+    let best = -1, bestD = rad * rad;
+    for (let i = 1; i < pts.length; i++) {
+      if (!(indigoSegHp(t, i - 1) > 0)) continue;
+      const a = pts[i - 1], b = pts[i], vx = b.x - a.x, vy = b.y - a.y, wx = x - a.x, wy = y - a.y;
+      const l2 = vx * vx + vy * vy || 1, u = clamp((wx * vx + wy * vy) / l2, 0, 1), px = a.x + vx * u, py = a.y + vy * u;
+      const d2 = (x - px) ** 2 + (y - py) ** 2;
+      if (d2 <= bestD) {
+        bestD = d2;
+        best = t.segBlock[i - 1];
+      }
+    }
+    return best;
+  }
+  function damageIndigo(t, i, x, y, kill = false) {
+    t.blockHp[i] = kill ? 0 : t.blockHp[i] - 1;
+    bursts.push({
+      x,
+      y,
+      r: 2,
+      maxR: 20,
+      t: 0,
+      d: .16,
+      color: COLORS[5].key
+    });
+    if (t.blockHp[i] <= 0) bursts.push({
+      x,
+      y,
+      r: 6,
+      maxR: 34,
+      t: 0,
+      d: .26,
+      color: "#dce3ff"
+    });
+  }
+  function breakIndigoAt(x, y, rad) {
+    for (const t of trails) {
+      if (t.color !== 5) continue;
+      const i = indigoHitBlock(x, y, t, rad);
+      if (i >= 0) damageIndigo(t, i, x, y, true);
+    }
+  }
+  function blockEnemyWithIndigo(e, oldX, oldY) {
+    for (const t of trails) {
+      if (t.color !== 5) continue;
+      const i = indigoHitBlock(e.x, e.y, t, e.r + 8);
+      if (i < 0) continue;
+      const x = e.x, y = e.y;
+      e.x = oldX;
+      e.y = oldY;
+      if (e.touch <= 0) {
+        damageIndigo(t, i, x, y);
+        e.touch = .6;
+      }
+      return true;
+    }
+    return false;
+  }
+  function pointNearTrail(x, y, t, rad) {
+    const pts = t.points;
+    if (pts.length < 1) return false;
+    const r2 = rad * rad;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i], vx = b.x - a.x, vy = b.y - a.y, wx = x - a.x, wy = y - a.y;
+      const l2 = vx * vx + vy * vy || 1, u = clamp((wx * vx + wy * vy) / l2, 0, 1), px = a.x + vx * u, py = a.y + vy * u;
+      if ((x - px) ** 2 + (y - py) ** 2 <= r2) return true;
+    }
+    return false;
+  }
+  function offscreenDist(cx, cy) {
+    const sx = Math.abs((cx - cy) * ISO_X), sy = Math.abs((cx + cy) * ISO_Y);
+    return Math.min(sx > 1e-4 ? (W * .5 + 60) / sx : Infinity, sy > 1e-4 ? (H * .54 + 60) / sy : Infinity);
+  }
+  function spawnEnemy() {
+    const a = rnd(0, TAU), ca = Math.cos(a), sa = Math.sin(a);
+    const d = offscreenDist(ca, sa) + rnd(15, 90), roll = Math.random();
+    const table = [ [ "ranged", gameTime >= 30 ? .18 + Math.min(.14, (gameTime - 30) * .0028) : 0 ], [ "runner", gameTime >= 90 ? .12 : 0 ], [ "charger", gameTime >= 150 ? .13 : 0 ], [ "melee", gameTime >= 210 ? .04 : 0, 1 ], [ "ranged", gameTime >= 270 ? .04 : 0, 1 ], [ "runner", gameTime >= 330 ? .04 : 0, 1 ], [ "charger", gameTime >= 390 ? .04 : 0, 1 ] ];
+    let type = "melee", elite = false, acc = 0;
+    for (const [t, p, e] of table) {
+      acc += p;
+      if (roll < acc) {
+        type = t;
+        elite = !!e;
+        break;
+      }
+    }
+    const stats = {
+      melee: {
+        hp: 55,
+        r: 16,
+        speed: 88,
+        damage: 15
+      },
+      runner: {
+        hp: 30,
+        r: 12,
+        speed: 165,
+        damage: 14
+      },
+      ranged: {
+        hp: 42,
+        r: 14,
+        speed: 67,
+        damage: 11
+      },
+      charger: {
+        hp: 68,
+        r: 17,
+        speed: 80,
+        damage: 22
+      }
+    }[type];
+    const statProg = Math.max(0, (gameTime - BOSS_TIME) / BOSS_TIME);
+    const hp = stats.hp * (1 + 4 * statProg) * (elite ? 2 : 1);
+    enemies.push({
+      id: idCounter++,
+      type,
+      elite,
+      x: cam.x + ca * d,
+      y: cam.y + sa * d,
+      r: stats.r * (elite ? 1.5 : 1),
+      hp,
+      maxHp: hp,
+      speed: stats.speed * (1 + statProg),
+      damage: stats.damage * (1 + 2 * statProg) * (elite ? 1.5 : 1),
+      shoot: rnd(.3, 1.4),
+      touch: 0,
+      slow: false,
+      weak: false,
+      hitFlash: 0,
+      kx: 0,
+      ky: 0,
+      redFloatTimer: 0,
+      redFloatDamage: 0,
+      sprintFloatTimer: 0,
+      sprintFloatDamage: 0,
+      onRed: false,
+      chargeState: "chase",
+      chargeTimer: 0,
+      chargeCooldown: rnd(1.3, 2.3),
+      chargeVX: 0,
+      chargeVY: 0
+    });
+  }
+  function inFrameDist(cx, cy) {
+    const sx = (cx - cy) * ISO_X, sy = (cx + cy) * ISO_Y;
+    const roomX = W * .5 - 110, roomY = sy > 0 ? H * .46 - 90 : H * .54 - 120;
+    return Math.min(Math.abs(sx) > 1e-4 ? roomX / Math.abs(sx) : Infinity, Math.abs(sy) > 1e-4 ? roomY / Math.abs(sy) : Infinity);
+  }
+  function spawnBoss() {
+    const a = rnd(0, TAU), ca = Math.cos(a), sa = Math.sin(a);
+    const dMax = inFrameDist(ca, sa), d = Math.max(Math.min(dMax, 140), dMax * rnd(.55, .95));
+    const hp = 4200;
+    enemies.push({
+      id: idCounter++,
+      type: "boss",
+      x: player.x + ca * d,
+      y: player.y + sa * d,
+      r: 34,
+      hp,
+      maxHp: hp,
+      speed: 96,
+      damage: 44,
+      touch: 0,
+      slow: false,
+      weak: false,
+      hitFlash: 0,
+      redFloatTimer: 0,
+      redFloatDamage: 0,
+      onRed: false,
+      sprintFloatTimer: 0,
+      sprintFloatDamage: 0,
+      kx: 0,
+      ky: 0,
+      entry: "fall",
+      fallZ: 820,
+      fallVZ: 0,
+      chargeState: "chase",
+      chargeTimer: 0,
+      chargeCooldown: rnd(2.6, 3.4),
+      chargeVX: 0,
+      chargeVY: 0,
+      chargeSpeed: 340,
+      rainbowCooldown: rnd(1, 5),
+      animT: 0,
+      visualYaw: 0,
+      gustTick: 0
+    });
+  }
+  function damageEnemy(e, dmg, orange = false, showFloater = true) {
+    if (e.entry === "fall") return 0;
+    if (e.weak) dmg *= 1 + player.violetAmp;
+    e.hp -= dmg;
+    e.hitFlash = .08;
+    const shown = Math.round(dmg);
+    if (showFloater && shown > 0 && Math.random() < .28) floaters.push({
+      x: e.x,
+      y: e.y,
+      z: 30,
+      t: 0,
+      text: shown,
+      color: orange ? COLORS[1].key : "#fff"
+    });
+    if (e.hp <= 0) killEnemy(e);
+    return dmg;
+  }
+  function collectPickup(p) {
+    if (p.type === "xp") {
+      gainXP(p.v);
+      return;
+    }
+    if (p.type === "heart") {
+      const healed = Math.min(player.maxHp - player.hp, player.maxHp * p.v);
+      player.hp += healed;
+      floaters.push({
+        x: player.x,
+        y: player.y,
+        z: 45 * PLAYER_SCALE,
+        t: 0,
+        text: "+" + Math.max(1, Math.round(healed)),
+        color: "#68dc74"
+      });
+      bursts.push({
+        x: p.x,
+        y: p.y,
+        r: 4,
+        maxR: 30,
+        t: 0,
+        d: .3,
+        color: "#ff5d78"
+      });
+      return;
+    }
+    player.paint = Math.min(player.maxPaint, player.paint + p.v);
+  }
+  function mergeOrSpawnXP(x, y, v) {
+    let count = 0, near = null, nearD = Infinity;
+    for (const p of pickups) {
+      if (p.type !== "xp") continue;
+      count++;
+      const d = len(x - p.x, y - p.y);
+      if (d < nearD) {
+        nearD = d;
+        near = p;
+      }
+    }
+    if (count >= XP_CAP && near) {
+      near.v += v;
+      near.x = x;
+      near.y = y;
+    } else pickups.push({
+      type: "xp",
+      x,
+      y,
+      v
+    });
+  }
+  function killEnemy(e) {
+    const idx = enemies.indexOf(e);
+    if (idx < 0) return;
+    enemies.splice(idx, 1);
+    killCount++;
+    if (e.type === "boss") {
+      for (let i = 0; i < 6; i++) bursts.push({
+        x: e.x + rnd(-20, 20),
+        y: e.y + rnd(-20, 20),
+        r: 6,
+        maxR: 70,
+        t: 0,
+        d: .5,
+        color: i % 2 ? "#ffffff" : COLORS[i % 7].key
+      });
+      spawnConfetti();
+      return;
+    }
+    const xpValue = (e.type === "charger" ? 6 : e.type === "runner" ? 5 : 4) * (e.elite ? 2 : 1);
+    mergeOrSpawnXP(e.x + rnd(-5, 5), e.y + rnd(-5, 5), xpValue);
+    if (Math.random() < .05) pickups.push({
+      type: "paint",
+      x: e.x + rnd(-14, 14),
+      y: e.y + rnd(-14, 14),
+      v: 20
+    });
+    if (player.hp < player.maxHp * .95 && Math.random() < .05) pickups.push({
+      type: "heart",
+      x: e.x + rnd(-16, 16),
+      y: e.y + rnd(-16, 16),
+      v: .12
+    });
+    bursts.push({
+      x: e.x,
+      y: e.y,
+      r: 4,
+      maxR: 26,
+      t: 0,
+      d: .22,
+      color: "#ffffff"
+    });
+  }
+  function shootEnemy(e) {
+    let dx = player.x - e.x, dy = player.y - e.y, l = len(dx, dy);
+    dx /= l;
+    dy /= l;
+    projectiles.push({
+      x: e.x,
+      y: e.y,
+      z: 12,
+      vx: dx * 180,
+      vy: dy * 180,
+      r: 7,
+      life: 4,
+      damage: e.damage
+    });
+  }
+  function shootBossRainbow(e) {
+    const a = Math.atan2(player.y - e.y, player.x - e.x), n = Math.floor(rnd(1, 6));
+    for (let i = 0; i < n; i++) {
+      const q = n === 1 ? 0 : (i / (n - 1) - .5) * .42, ang = a + q;
+      projectiles.push({
+        x: e.x,
+        y: e.y,
+        z: 14,
+        vx: Math.cos(ang) * 300,
+        vy: Math.sin(ang) * 300,
+        r: 18,
+        life: 4.5,
+        damage: 30,
+        rainbow: true,
+        hue: 0
+      });
+    }
+  }
+  const RARITY = [ {
+    name: "COMMON",
+    color: "#b9c2d0",
+    w: .55,
+    lo: .85,
+    hi: 1.15
+  }, {
+    name: "RARE",
+    color: "#5bc8ff",
+    w: .29,
+    lo: 1.35,
+    hi: 1.75
+  }, {
+    name: "EPIC",
+    color: "#c07bff",
+    w: .13,
+    lo: 2.1,
+    hi: 2.6
+  }, {
+    name: "LEGENDARY",
+    color: "#ffcf4d",
+    w: .03,
+    lo: 3.2,
+    hi: 4
+  } ];
+  const UPGRADES = [ {
+    name: "Red Damage",
+    color: COLORS[0].key,
+    fmt: "pct",
+    amt: .16,
+    apply: v => player.redDps *= 1 + v
+  }, {
+    name: "Orange Blast",
+    color: COLORS[1].key,
+    fmt: "pct",
+    amt: .15,
+    apply: v => player.orangeDamage *= 1 + v
+  }, {
+    name: "Yellow Speed",
+    color: COLORS[2].key,
+    fmt: "pct",
+    amt: .12,
+    apply: v => player.yellowBoost += v
+  }, {
+    name: "Green Healing",
+    color: COLORS[3].key,
+    fmt: "pct",
+    amt: .18,
+    apply: v => player.greenHps *= 1 + v
+  }, {
+    name: "Blue Slow",
+    color: COLORS[4].key,
+    fmt: "pct",
+    amt: .13,
+    apply: v => player.blueSlow *= 1 - clamp(v * .55, 0, .6)
+  }, {
+    name: "Indigo Wall",
+    color: COLORS[5].key,
+    fmt: "int",
+    amt: 1,
+    apply: v => player.indigoHp += Math.max(1, Math.round(v))
+  }, {
+    name: "Violet Amp",
+    color: COLORS[6].key,
+    fmt: "pct",
+    amt: .11,
+    apply: v => player.violetAmp += v
+  }, {
+    name: "Sprint",
+    icon: 1,
+    color: "#7ef0ff",
+    fmt: "pct",
+    amt: .08,
+    apply: v => player.sprintMult *= 1 + v
+  }, {
+    name: "Vitality",
+    icon: 2,
+    color: "#ff596d",
+    fmt: "flat",
+    amt: 14,
+    apply: v => {
+      const n = Math.round(v);
+      player.maxHp += n;
+      player.hp += n;
+      player.hpRegen *= 1 + v / 90;
+    }
+  }, {
+    name: "Stamina",
+    icon: 3,
+    color: "#53e1df",
+    fmt: "flat",
+    amt: 10,
+    apply: v => {
+      const n = Math.round(v);
+      player.maxStamina += n;
+      player.stamina += n;
+    }
+  }, {
+    name: "Paint",
+    icon: 4,
+    color: "#c9a6ff",
+    fmt: "flat",
+    amt: 14,
+    apply: v => {
+      const n = Math.round(v);
+      player.maxPaint += n;
+      player.paint += n;
+      player.paintRegen *= 1 + v / 90;
+    }
+  }, {
+    name: "Rainbow Time",
+    icon: 5,
+    color: "#ffffff",
+    fmt: "pct",
+    amt: .14,
+    apply: v => player.rainbowLife *= 1 + v
+  }, {
+    name: "Magnet",
+    icon: 6,
+    color: "#9fe36b",
+    fmt: "flat",
+    amt: 26,
+    apply: v => player.magnet += Math.round(v)
+  } ];
+  function rollRarity() {
+    let r = Math.random();
+    for (const t of RARITY) {
+      if (r < t.w) return t;
+      r -= t.w;
+    }
+    return RARITY[0];
+  }
+  function rollCard(def) {
+    const rarity = rollRarity(), value = def.amt * rnd(rarity.lo, rarity.hi);
+    return {
+      def,
+      rarity,
+      value,
+      text: fmtValue(def.fmt, value)
+    };
+  }
+  function fmtValue(fmt, v) {
+    if (fmt === "pct") return "+" + Math.round(v * 100) + "%";
+    return "+" + Math.max(1, Math.round(v));
+  }
+  function makeChoices() {
+    const pool = [ ...UPGRADES ];
+    levelChoices = [];
+    for (let i = 0; i < 3 && pool.length; i++) levelChoices.push(rollCard(pool.splice(Math.floor(rnd(0, pool.length)), 1)[0]));
+    paused = true;
+    mouse.down = false;
+    endStroke();
+    menuOpenAt = performance.now();
+    menuCloseAt = -1;
+    menuChosen = -1;
+  }
+  function chooseUpgrade(i) {
+    if (!paused || menuCloseAt >= 0 || !levelChoices[i]) return;
+    levelChoices[i].def.apply(levelChoices[i].value);
+    menuChosen = i;
+    menuCloseAt = performance.now();
+  }
+  function updateMenuAnim() {
+    if (menuCloseAt < 0) return;
+    if ((performance.now() - menuCloseAt) / 1e3 < MENU_OUT) return;
+    paused = false;
+    levelChoices = [];
+    menuOpenAt = -1;
+    menuCloseAt = -1;
+    menuChosen = -1;
+  }
+  const CONFETTI_CAP = 200;
+  function spawnConfettiPiece(y) {
+    confetti.push({
+      x: rnd(-20, W + 20),
+      y,
+      vx: rnd(-45, 45),
+      vy: rnd(70, 170),
+      rot: rnd(0, TAU),
+      vr: rnd(-9, 9),
+      w: rnd(4, 8),
+      h: rnd(3, 6),
+      color: COLORS[Math.floor(rnd(0, 7))].key,
+      t: 0,
+      d: rnd(9, 13)
+    });
+  }
+  function spawnConfetti() {
+    for (let i = 0; i < 70; i++) spawnConfettiPiece(-rnd(10, H * 1.25));
+  }
+  function gainXP(v) {
+    player.xp += v;
+    if (player.xp >= player.xpNext) {
+      player.xp -= player.xpNext;
+      player.level++;
+      player.xpNext = Math.floor(player.xpNext * 1.12 + 5);
+      levelFxStart = performance.now();
+      spawnConfetti();
+      makeChoices();
+    }
+  }
+  function spawnSprintGust(x, y, dx, dy, S) {
+    const d = norm(dx, dy);
+    if (!d.x && !d.y) return;
+    const back = (10 + rnd(0, 18)) * S, px = -d.y, py = d.x;
+    const bx = x - d.x * back, by = y - d.y * back;
+    const life = rnd(.26, .36), scale = S / PLAYER_SCALE;
+    const wp = (forward, lateral, z) => ({
+      x: bx + d.x * forward + px * lateral,
+      y: by + d.y * forward + py * lateral,
+      z
+    });
+    const mk = (z, lat) => {
+      const len = rnd(15, 25) * scale;
+      return {
+        a: wp(-len, lat, z),
+        b: wp(len * .15, lat, z),
+        lw: rnd(1, 1.8) * scale,
+        alpha: rnd(.09, .2)
+      };
+    };
+    gusts.push({
+      life,
+      maxLife: life,
+      lines: [ mk(4 * S, rnd(-9, 9) * S), mk(15 * S, rnd(-7, 7) * S), mk(26 * S, rnd(-8, 8) * S) ]
+    });
+  }
+  function update(dt) {
+    if (dead) {
+      return;
+    }
+    if (paused) {
+      return;
+    }
+    if (!started) {
+      return;
+    }
+    gameTime += dt;
+    player.invuln = Math.max(0, player.invuln - dt);
+    player.sprintImpactCd = Math.max(0, player.sprintImpactCd - dt);
+    player.noHitTime += dt;
+    if (player.noHitTime > REGEN_DELAY) player.hp = Math.min(player.maxHp, player.hp + player.hpRegen * dt);
+    player.paint = Math.min(player.maxPaint, player.paint + player.paintRegen * dt);
+    addStrokePoint();
+    let mx = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0), my = (keys.has("KeyS") ? 1 : 0) - (keys.has("KeyW") ? 1 : 0);
+    let m = screenMoveToWorld(mx, my);
+    if (mx || my) {
+      player.faceX = m.x;
+      player.faceY = m.y;
+    }
+    const moving = !!(mx || my);
+    let speed = player.speed;
+    for (const t of trails) if (t.color === 2 && pointNearTrail(player.x, player.y, t, 22)) {
+      speed *= 1 + player.yellowBoost;
+      break;
+    }
+    const wasSprinting = player.sprinting;
+    const wantsSprint = keys.has("Space") && moving && !player.sprintBlocked && player.stamina > 0;
+    player.sprinting = wantsSprint;
+    if (player.sprinting) {
+      if (!wasSprinting) {
+        player.sprintTime = 0;
+        player._sprintHitAt = new Map;
+        player.sprintWindTick = 0;
+        player.sprintMultCur = SPRINT_BOOST;
+      }
+      player.sprintTime += dt;
+      player.sprintMultCur = Math.min(SPRINT_MAX, player.sprintMultCur + SPRINT_ACCEL * dt);
+      speed *= player.sprintMultCur * player.sprintMult;
+      player.sprintSpeedRatio = speed / player.speed;
+      player.stamina = Math.max(0, player.stamina - player.staminaDrain * dt);
+      if (player.stamina <= 0) {
+        player.stamina = 0;
+        player.sprintBlocked = true;
+        player.sprinting = false;
+        player.sprintTime = 0;
+      }
+    } else {
+      player.sprintTime = 0;
+      player.sprintSpeedRatio = 1;
+      player.sprintMultCur = 1;
+      player.stamina = Math.min(player.maxStamina, player.stamina + player.staminaRegen * dt);
+    }
+    const prevPX = player.x, prevPY = player.y;
+    if (moving) {
+      player.x += m.x * speed * dt;
+      player.y += m.y * speed * dt;
+    }
+    resolvePropCollisions(player);
+    const pd = Math.hypot(player.x, player.y);
+    if (pd > MAP_RADIUS) {
+      player.x *= MAP_RADIUS / pd;
+      player.y *= MAP_RADIUS / pd;
+    }
+    if (player.sprinting) {
+      for (const e of [ ...enemies ]) {
+        if (!enemies.includes(e)) continue;
+        if (e.entry === "fall") continue;
+        const hitR = player.r + e.r + 9;
+        if (dist2(player, e) >= hitR * hitR) continue;
+        const lastHit = player._sprintHitAt.get(e.id);
+        if ((lastHit === undefined || player.sprintTime - lastHit > SPRINT_REHIT) && player.sprintImpactCd <= 0) {
+          player._sprintHitAt.set(e.id, player.sprintTime);
+          player.sprintImpactCd = .4;
+          const impactScale = Math.max(1, player.sprintSpeedRatio);
+          const dealt = damageEnemy(e, player.sprintBurstDamage * impactScale, false, false);
+          if (enemies.includes(e)) {
+            const ox = e.x - player.x, oy = e.y - player.y;
+            const n = ox * ox + oy * oy > 1e-6 ? norm(ox, oy) : m;
+            const kq = clamp(impactScale, 1, SPRINT_MAX);
+            const v0 = e.speed * KNOCK_RATIO * lerp(.75, 1.25, (kq - 1) / (SPRINT_MAX - 1));
+            e.kx = n.x * v0;
+            e.ky = n.y * v0;
+            e.touch = Math.max(e.touch, .45);
+          }
+          floaters.push({
+            x: e.x,
+            y: e.y,
+            z: 34,
+            t: 0,
+            text: Math.round(dealt),
+            color: "#70efe9"
+          });
+          if (impactScale >= SPRINT_STOP_MIN) {
+            const q = clamp((impactScale - SPRINT_STOP_MIN) / (SPRINT_MAX - SPRINT_STOP_MIN), 0, 1);
+            freeze(lerp(.05, .11, q));
+            addShake(lerp(4, 8, q), .18);
+          }
+          player.sprintMultCur = Math.max(1, player.sprintMultCur * .7);
+        } else {
+          const impactScale = Math.max(1, player.sprintSpeedRatio);
+          const dealt = damageEnemy(e, player.sprintDps * impactScale * dt, false, false);
+          if (enemies.includes(e)) {
+            e.sprintFloatDamage += dealt;
+            e.sprintFloatTimer += dt;
+            if (e.sprintFloatTimer >= .28) {
+              const shown = Math.round(e.sprintFloatDamage);
+              if (shown > 0) floaters.push({
+                x: e.x,
+                y: e.y,
+                z: 30,
+                t: 0,
+                text: shown,
+                color: "#9ff6f2"
+              });
+              e.sprintFloatTimer = 0;
+              e.sprintFloatDamage = 0;
+            }
+          }
+        }
+      }
+    }
+    if (player.sprinting) {
+      const vfxDX = player.x - prevPX, vfxDY = player.y - prevPY;
+      if (Math.hypot(vfxDX, vfxDY) > .001) {
+        const gustGap = clamp(.072 / Math.max(1, player.sprintSpeedRatio * .55), .022, .072);
+        player.sprintWindTick -= dt;
+        while (player.sprintWindTick <= 0) {
+          spawnSprintGust(player.x, player.y, Math.cos(player.visualYaw), Math.sin(player.visualYaw), PLAYER_SCALE);
+          player.sprintWindTick += gustGap;
+        }
+      } else player.sprintWindTick = 0;
+    }
+    player.sprintVisual = lerp(player.sprintVisual, player.sprinting ? 1 : 0, 1 - Math.pow(player.sprinting ? 3e-5 : .0025, dt));
+    const sprintAlpha = clamp(player.sprintVisual, 0, 1);
+    const targetYaw = Math.atan2(player.faceY, player.faceX);
+    const turnRate = lerp(12, 5.5, sprintAlpha);
+    const maxYawStep = turnRate * dt;
+    player.visualYaw += clamp(angDiff(targetYaw, player.visualYaw), -maxYawStep, maxYawStep);
+    const actualSpeed = Math.hypot(player.x - prevPX, player.y - prevPY) / Math.max(dt, 1e-6);
+    const speedRatio = clamp(actualSpeed / player.speed, 0, 5.6);
+    const strideTarget = moving ? clamp(.7 + speedRatio * .7 + sprintAlpha * .45, 0, 4.6) : 0;
+    const animSpeedTarget = moving ? clamp(.55 + speedRatio * .95 + sprintAlpha * .55, 0, 6.2) : 0;
+    player.strideAmt = lerp(player.strideAmt, strideTarget, 1 - Math.pow(55e-5, dt));
+    player.animSpeedMul = lerp(player.animSpeedMul, animSpeedTarget, 1 - Math.pow(5e-4, dt));
+    if (player.animSpeedMul > .02) player.moveAnim += dt * (4.5 + 8.5 * player.animSpeedMul);
+    player.bob = lerp(player.bob, moving ? clamp(.45 + speedRatio * .65 + sprintAlpha * .25, 0, 1.7) : 0, 1 - Math.pow(65e-5, dt));
+    for (const t of trails) if (t.color === 3 && pointNearTrail(player.x, player.y, t, 22)) {
+      player.hp = Math.min(player.maxHp, player.hp + player.greenHps * dt);
+      break;
+    }
+    for (const e of [ ...enemies ]) {
+      if (e.entry === "fall") {
+        e.fallVZ += 2600 * dt;
+        e.fallZ -= e.fallVZ * dt;
+        if (e.fallZ <= 0) {
+          e.fallZ = 0;
+          e.entry = null;
+          e.touch = .7;
+          addShake(16, .5);
+          for (let i = 0; i < 3; i++) bursts.push({
+            x: e.x,
+            y: e.y,
+            r: 10,
+            maxR: 120 + i * 40,
+            t: 0,
+            d: .45,
+            color: i ? "#ffffff" : "#ff2850"
+          });
+        }
+        continue;
+      }
+      e.hitFlash = Math.max(0, e.hitFlash - dt);
+      e.touch = Math.max(0, e.touch - dt);
+      e.slow = false;
+      e.weak = false;
+      e.onRed = false;
+      e.redFloatTimer = Math.max(0, e.redFloatTimer - dt);
+      let redContacts = 0;
+      for (const t of trails) {
+        if (t.color === 0 && pointNearTrail(e.x, e.y, t, 31)) {
+          e.onRed = true;
+          redContacts++;
+        } else if (t.color === 4 && pointNearTrail(e.x, e.y, t, 22)) e.slow = true; else if (t.color === 6 && pointNearTrail(e.x, e.y, t, 22)) e.weak = true;
+      }
+      if (e.onRed) {
+        const redMult = Math.max(1, redContacts);
+        e.redFloatDamage += damageEnemy(e, player.redDps * redMult * dt, false, false);
+        if (e.redFloatTimer <= 0 && e.redFloatDamage >= 1) {
+          floaters.push({
+            x: e.x,
+            y: e.y,
+            z: 30,
+            t: 0,
+            text: Math.max(1, Math.round(e.redFloatDamage)),
+            color: COLORS[0].key
+          });
+          e.redFloatDamage = 0;
+          e.redFloatTimer = .38;
+        }
+      }
+      if (e.hp <= 0) continue;
+      let dx = player.x - e.x, dy = player.y - e.y, d = len(dx, dy), nx = dx / d, ny = dy / d, sp = e.speed * (e.slow ? player.blueSlow : 1);
+      if (e.type === "melee" || e.type === "runner") {
+        const ex = e.x, ey = e.y;
+        e.x += nx * sp * dt;
+        e.y += ny * sp * dt;
+        resolvePropCollisions(e);
+        const wall = blockEnemyWithIndigo(e, ex, ey);
+        if (!wall && d < e.r + player.r + 5 && e.touch <= 0) {
+          hurtPlayer(e.damage);
+          e.touch = .7;
+        }
+      } else if (e.type === "ranged") {
+        const ideal = 250, ex = e.x, ey = e.y;
+        let dir = d > ideal + 30 ? 1 : d < ideal - 35 ? -1 : 0;
+        e.x += nx * sp * dir * dt;
+        e.y += ny * sp * dir * dt;
+        resolvePropCollisions(e);
+        blockEnemyWithIndigo(e, ex, ey);
+        e.shoot -= dt;
+        if (e.shoot <= 0 && d < 430) {
+          shootEnemy(e);
+          e.shoot = rnd(1.4, 2.15);
+        }
+      } else if (e.type === "charger") {
+        e.chargeCooldown = Math.max(0, e.chargeCooldown - dt);
+        if (e.chargeState === "windup") {
+          e.chargeTimer -= dt;
+          if (e.chargeTimer <= 0) {
+            e.chargeState = "charge";
+            e.chargeTimer = .5;
+          }
+        } else if (e.chargeState === "charge") {
+          e.chargeTimer -= dt;
+          const chargeMul = e.slow ? player.blueSlow : 1, ex = e.x, ey = e.y;
+          const chargeSpeed = e.speed * 4, intendedX = e.x + e.chargeVX * chargeSpeed * chargeMul * dt, intendedY = e.y + e.chargeVY * chargeSpeed * chargeMul * dt;
+          e.x = intendedX;
+          e.y = intendedY;
+          resolvePropCollisions(e);
+          const wall = blockEnemyWithIndigo(e, ex, ey), hitObstacle = wall || Math.hypot(e.x - intendedX, e.y - intendedY) > 1;
+          const pd = Math.hypot(player.x - e.x, player.y - e.y);
+          if (!wall && pd < e.r + player.r + 7 && e.touch <= 0) {
+            hurtPlayer(e.damage);
+            e.touch = 1;
+            e.chargeState = "chase";
+            e.chargeCooldown = rnd(2, 2.8);
+          } else if (hitObstacle || e.chargeTimer <= 0) {
+            e.chargeState = "chase";
+            e.chargeCooldown = rnd(1.8, 2.7);
+          }
+        } else {
+          const ex = e.x, ey = e.y;
+          e.x += nx * sp * dt;
+          e.y += ny * sp * dt;
+          resolvePropCollisions(e);
+          const wall = blockEnemyWithIndigo(e, ex, ey);
+          if (d < 265 && d > 75 && e.chargeCooldown <= 0) {
+            e.chargeState = "windup";
+            e.chargeTimer = .42;
+            e.chargeVX = nx;
+            e.chargeVY = ny;
+          }
+          if (!wall && d < e.r + player.r + 5 && e.touch <= 0) {
+            hurtPlayer(e.damage * .45);
+            e.touch = .7;
+          }
+        }
+      } else if (e.type === "boss") {
+        e.animT = (e.animT || 0) + dt;
+        e.chargeCooldown = Math.max(0, e.chargeCooldown - dt);
+        e.rainbowCooldown = Math.max(0, e.rainbowCooldown - dt);
+        if (e.chargeState === "windup") {
+          e.chargeTimer -= dt;
+          if (e.chargeTimer <= 0) {
+            e.chargeState = "charge";
+            e.chargeTimer = .5;
+            e.gustTick = 0;
+          }
+        } else if (e.chargeState === "charge") {
+          e.chargeTimer -= dt;
+          e.gustTick -= dt;
+          while (e.gustTick <= 0) {
+            spawnSprintGust(e.x, e.y, e.chargeVX, e.chargeVY, BOSS_SCALE);
+            e.gustTick += .035;
+          }
+          const chargeMul = e.slow ? player.blueSlow : 1, ex = e.x, ey = e.y;
+          const intendedX = e.x + e.chargeVX * e.chargeSpeed * chargeMul * dt, intendedY = e.y + e.chargeVY * e.chargeSpeed * chargeMul * dt;
+          e.x = intendedX;
+          e.y = intendedY;
+          resolvePropCollisions(e);
+          breakIndigoAt(e.x, e.y, e.r + 8);
+          const hitObstacle = Math.hypot(e.x - intendedX, e.y - intendedY) > 1;
+          const pd = Math.hypot(player.x - e.x, player.y - e.y);
+          if (pd < e.r + player.r + 9 && e.touch <= 0) {
+            hurtPlayer(e.damage * 2.6);
+            e.touch = 1;
+            e.chargeState = "chase";
+            e.chargeCooldown = rnd(3.2, 4.2);
+          } else if (hitObstacle || e.chargeTimer <= 0) {
+            e.chargeState = "chase";
+            e.chargeCooldown = rnd(3, 3.8);
+          }
+        } else {
+          const targetYaw = Math.atan2(ny, nx), turnRate = 6, maxStep = turnRate * dt;
+          e.visualYaw = (e.visualYaw || 0) + clamp(angDiff(targetYaw, e.visualYaw || 0), -maxStep, maxStep);
+          const ex = e.x, ey = e.y;
+          e.x += nx * sp * dt;
+          e.y += ny * sp * dt;
+          resolvePropCollisions(e);
+          const wall = blockEnemyWithIndigo(e, ex, ey);
+          if (d < 420 && d > 150 && e.chargeCooldown <= 0) {
+            e.chargeState = "windup";
+            e.chargeTimer = .6;
+            e.chargeVX = nx;
+            e.chargeVY = ny;
+          } else if (e.rainbowCooldown <= 0 && d > 90) {
+            shootBossRainbow(e);
+            e.rainbowCooldown = rnd(1, 5);
+          }
+          if (!wall && d < e.r + player.r + 7 && e.touch <= 0) {
+            hurtPlayer(e.damage * .5);
+            e.touch = .8;
+          }
+        }
+      }
+      if (e.kx || e.ky) {
+        const px = e.x, py = e.y;
+        e.x += e.kx * dt;
+        e.y += e.ky * dt;
+        resolvePropCollisions(e);
+        const wall = blockEnemyWithIndigo(e, px, py);
+        if (wall || Math.hypot(e.x - px - e.kx * dt, e.y - py - e.ky * dt) > 1) {
+          e.kx = 0;
+          e.ky = 0;
+        } else {
+          const f = Math.pow(KNOCK_DECAY, dt);
+          e.kx *= f;
+          e.ky *= f;
+          if (Math.hypot(e.kx, e.ky) < KNOCK_STOP) {
+            e.kx = 0;
+            e.ky = 0;
+          }
+        }
+      }
+    }
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i], d2 = (e.x - player.x) ** 2 + (e.y - player.y) ** 2;
+      if (e.type === "boss") {
+        if (e.entry !== "fall" && d2 > BOSS_RECALL * BOSS_RECALL) {
+          const a = rnd(0, TAU), ca = Math.cos(a), sa = Math.sin(a), d = offscreenDist(ca, sa) + rnd(15, 90);
+          e.x = player.x + ca * d;
+          e.y = player.y + sa * d;
+        }
+      } else if (d2 > TRASH_DESPAWN * TRASH_DESPAWN) enemies.splice(i, 1);
+    }
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const p = projectiles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.rainbow) p.hue = (p.hue + dt * 260) % 360;
+      let blocked = false;
+      if (p.rainbow) breakIndigoAt(p.x, p.y, p.r); else for (const t of trails) {
+        if (t.color !== 5) continue;
+        const bi = indigoHitBlock(p.x, p.y, t, Math.max(10, p.r));
+        if (bi < 0) continue;
+        damageIndigo(t, bi, p.x, p.y);
+        blocked = true;
+        break;
+      }
+      if (blocked || p.life <= 0) {
+        projectiles.splice(i, 1);
+        continue;
+      }
+      if (dist2(p, player) < (p.r + player.r) ** 2) {
+        hurtPlayer(p.damage);
+        projectiles.splice(i, 1);
+      }
+    }
+    for (let i = trails.length - 1; i >= 0; i--) {
+      const t = trails[i];
+      t.life -= dt;
+      const spent = t.color === 5 && t.blockHp && t.blockHp.length > 0 && !t.blockHp.some(h => h > 0);
+      if (t.life <= 0 || spent) {
+        if (currentStroke === t) currentStroke = null;
+        trails.splice(i, 1);
+      }
+    }
+    for (let i = pickups.length - 1; i >= 0; i--) {
+      const p = pickups[i], dx = player.x - p.x, dy = player.y - p.y, d = len(dx, dy);
+      if (d < player.magnet) {
+        const k = clamp(220 / d, 2, 8);
+        p.x += dx / d * 80 * k * dt;
+        p.y += dy / d * 80 * k * dt;
+      }
+      if (d < 24) {
+        collectPickup(p);
+        pickups.splice(i, 1);
+      }
+    }
+    for (let i = gusts.length - 1; i >= 0; i--) {
+      const g = gusts[i];
+      g.life -= dt;
+      if (g.life <= 0) gusts.splice(i, 1);
+    }
+    for (let i = bursts.length - 1; i >= 0; i--) {
+      bursts[i].t += dt;
+      if (bursts[i].t > bursts[i].d) bursts.splice(i, 1);
+    }
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      floaters[i].t += dt;
+      floaters[i].z += 16 * dt;
+      if (floaters[i].t > .7) floaters.splice(i, 1);
+    }
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      const prog = Math.min(1, gameTime / BOSS_TIME);
+      if (enemies.length < 24 + prog * 56) spawnEnemy();
+      spawnTimer = 1 / (.9 + prog * 3.6);
+    }
+    if (!bossSpawned && gameTime >= BOSS_TIME) {
+      bossSpawned = true;
+      spawnBoss();
+    }
+    cam.x = lerp(cam.x, player.x, 1 - Math.pow(.001, dt));
+    cam.y = lerp(cam.y, player.y, 1 - Math.pow(.001, dt));
+  }
+  function sprintDamageReduction() {
+    if (!player.sprinting) return 0;
+    if (player.sprintTime <= .18) return 1;
+    const q = clamp((player.sprintTime - .18) / 1.05, 0, 1);
+    const eased = q * q * (3 - 2 * q);
+    return lerp(1, .3, eased);
+  }
+  function hurtPlayer(d) {
+    player.noHitTime = 0;
+    if (player.invuln > 0 || dead) return;
+    const reduction = sprintDamageReduction();
+    if (reduction >= .999) return;
+    const dealt = d * (1 - reduction);
+    player.hp -= dealt;
+    player.invuln = .38;
+    flashT = FLASH_D;
+    addShake(7, .24);
+    freeze(.07);
+    floaters.push({
+      x: player.x,
+      y: player.y,
+      z: 45 * PLAYER_SCALE,
+      t: 0,
+      text: "-" + Math.max(1, Math.round(dealt)),
+      color: reduction > 0 ? "#ff9f86" : "#ff596d"
+    });
+    if (player.hp <= 0) {
+      player.hp = 0;
+      dead = true;
+      mouse.down = false;
+      endStroke();
+    }
+  }
+  function poly(points, fill, stroke = null, lw = 1) {
+    ctx.beginPath();
+    ctx.moveTo(points[0][0], points[0][1]);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lw;
+      ctx.stroke();
+    }
+  }
+  function shadow(s, r, a = .2) {
+    ctx.fillStyle = `rgba(0,0,0,${a})`;
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y + 8, r * 1.05, r * .42, 0, 0, TAU);
+    ctx.fill();
+  }
+  function ngon(r, n, rot = 0) {
+    const p = [];
+    for (let i = 0; i < n; i++) {
+      const a = rot - Math.PI / 2 + i * TAU / n;
+      p.push([ Math.cos(a) * r, Math.sin(a) * r ]);
+    }
+    return p;
+  }
+  function addPropFace(out, pts, color) {
+    const sp = pts.map(p => worldToScreen(p.x, p.y, p.z));
+    const depth = pts.reduce((a, p) => a + p.x + p.y + p.z * .35, 0) / pts.length;
+    out.push({
+      pts: sp,
+      color,
+      depth
+    });
+  }
+  function drawPropFaces(faces) {
+    faces.sort((a, b) => a.depth - b.depth);
+    for (const f of faces) poly(f.pts.map(p => [ p.x, p.y ]), f.color);
+  }
+  function propRing(x, y, z, r, n, rot = 0, scaleX = 1, scaleY = 1) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = rot + i * TAU / n;
+      out.push(v3(x + Math.cos(a) * r * scaleX, y + Math.sin(a) * r * scaleY, z));
+    }
+    return out;
+  }
+  function addPropPrism(faces, x, y, z0, z1, r, n, color, rot = 0) {
+    const A = propRing(x, y, z0, r, n, rot), B = propRing(x, y, z1, r * .92, n, rot);
+    for (let i = 0; i < n; i++) addPropFace(faces, [ A[i], A[(i + 1) % n], B[(i + 1) % n], B[i] ], shadeHex(color, .78 + i % 3 * .07));
+    addPropFace(faces, B, shadeHex(color, 1.08));
+  }
+  function addPropCone(faces, x, y, zBase, zTop, r, n, color, rot = 0) {
+    const A = propRing(x, y, zBase, r, n, rot), tip = v3(x, y, zTop);
+    for (let i = 0; i < n; i++) addPropFace(faces, [ A[i], A[(i + 1) % n], tip ], shadeHex(color, .78 + i % 3 * .08));
+  }
+  function drawFacetedRock(x, y, s = 1, rot = 0) {
+    const p = worldToScreen(x, y), faces = [], n = 7, r = 15 * s, h = 17 * s;
+    shadow(p, 14 * s, .14);
+    const A = [], B = [];
+    for (let i = 0; i < n; i++) {
+      const a = rot + i * TAU / n, warp = .88 + .13 * Math.sin(i * 2.31 + rot * 1.7);
+      A.push(v3(x + Math.cos(a) * r * warp, y + Math.sin(a) * r * warp, 0));
+      B.push(v3(x + Math.cos(a) * r * .62 * warp, y + Math.sin(a) * r * .62 * warp, h * (.58 + .09 * Math.cos(i * 1.7))));
+    }
+    const top = v3(x - 2 * s * Math.cos(rot), y - 2 * s * Math.sin(rot), h);
+    for (let i = 0; i < n; i++) {
+      addPropFace(faces, [ A[i], A[(i + 1) % n], B[(i + 1) % n], B[i] ], shadeHex("#7b8089", .76 + i % 3 * .08));
+      addPropFace(faces, [ B[i], B[(i + 1) % n], top ], shadeHex("#8e949d", .92 + i % 2 * .08));
+    }
+    drawPropFaces(faces);
+  }
+  function drawTree(x, y, s = 1, rot = 0) {
+    const p = worldToScreen(x, y), faces = [];
+    shadow(p, 15 * s, .13);
+    addPropPrism(faces, x, y, 0, 24 * s, 5.2 * s, 6, "#765338", rot);
+    addPropCone(faces, x, y, 16 * s, 50 * s, 22 * s, 7, "#477d50", rot + .15);
+    addPropCone(faces, x, y, 29 * s, 62 * s, 16.5 * s, 7, "#57905c", rot + .48);
+    drawPropFaces(faces);
+  }
+  function drawProp(o) {
+    const p = worldToScreen(o.x, o.y);
+    if (p.x < -100 || p.x > W + 100 || p.y < -130 || p.y > H + 100) return;
+    if (o.type === "rock") drawFacetedRock(o.x, o.y, o.s, o.rot); else if (o.type === "tree") drawTree(o.x, o.y, o.s, o.rot); else if (o.type === "bush") {
+      shadow(p, 12 * o.s, .08);
+      poly([ [ p.x - 14 * o.s, p.y ], [ p.x - 7 * o.s, p.y - 12 * o.s ], [ p.x + 2 * o.s, p.y - 8 * o.s ], [ p.x + 12 * o.s, p.y - 2 * o.s ], [ p.x + 8 * o.s, p.y + 9 * o.s ], [ p.x - 8 * o.s, p.y + 9 * o.s ] ], "#5f9358");
+    } else {
+      ctx.strokeStyle = "#759865";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y + 4);
+      ctx.lineTo(p.x - 3, p.y - 5);
+      ctx.moveTo(p.x, p.y + 3);
+      ctx.lineTo(p.x + 4, p.y - 4);
+      ctx.stroke();
+    }
+  }
+  function shadeHex(hex, k) {
+    const n = parseInt(hex.slice(1), 16), r = n >> 16, g = n >> 8 & 255, b = n & 255;
+    const f = v => Math.round(clamp(v * k, 0, 255)).toString(16).padStart(2, "0");
+    return "#" + f(r) + f(g) + f(b);
+  }
+  function v3(x, y, z) {
+    return {
+      x,
+      y,
+      z
+    };
+  }
+  function vsub(a, b) {
+    return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+  }
+  function vadd(a, b) {
+    return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+  }
+  function vmul(a, s) {
+    return v3(a.x * s, a.y * s, a.z * s);
+  }
+  function vdot(a, b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+  }
+  function vcross(a, b) {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+  }
+  function vnorm(a) {
+    const l = Math.hypot(a.x, a.y, a.z) || 1;
+    return v3(a.x / l, a.y / l, a.z / l);
+  }
+  const UNI_SCALE_X = .88, UNI_SCALE_Y = .92, UNI_SCALE_Z = .88;
+  let uOriginX = 0, uOriginY = 0, uScaleMul = 1;
+  function uScale(p) {
+    return v3(p.x * UNI_SCALE_X * uScaleMul, p.y * UNI_SCALE_Y * uScaleMul, p.z * UNI_SCALE_Z * uScaleMul);
+  }
+  function uRotate(p, yaw) {
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    return v3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
+  }
+  function uWorld(p, yaw) {
+    const q = uRotate(uScale(p), yaw);
+    return v3(uOriginX + q.x, uOriginY + q.y, q.z);
+  }
+  function uScreen(p, yaw) {
+    const q = uWorld(p, yaw);
+    return worldToScreen(q.x, q.y, q.z);
+  }
+  function addUFace(out, pts, color, yaw, normal = null) {
+    const wpts = pts.map(p => uWorld(p, yaw)), spts = wpts.map(p => worldToScreen(p.x, p.y, p.z));
+    let n = normal;
+    if (!n && pts.length >= 3) n = vnorm(vcross(vsub(pts[1], pts[0]), vsub(pts[2], pts[0])));
+    if (n) n = uRotate(n, yaw);
+    const light = vnorm(v3(-.45, -.55, 1.15));
+    const lit = n ? .9 + Math.max(0, vdot(n, light)) * .24 : .95;
+    const depth = wpts.reduce((a, p) => a + p.x + p.y + 1.15 * p.z, 0) / wpts.length;
+    out.push({
+      pts: spts,
+      color: shadeHex(color, lit),
+      depth
+    });
+  }
+  function addTube(out, a, b, r1, r2, sides, color, yaw, phase = 0) {
+    const d = vnorm(vsub(b, a));
+    let ref = Math.abs(d.z) > .88 ? v3(0, 1, 0) : v3(0, 0, 1);
+    const u = vnorm(vcross(d, ref)), v = vnorm(vcross(u, d));
+    const A = [], B = [];
+    for (let i = 0; i < sides; i++) {
+      const ang = phase + i * TAU / sides, cs = Math.cos(ang), sn = Math.sin(ang);
+      A.push(vadd(a, vadd(vmul(u, cs * r1), vmul(v, sn * r1))));
+      B.push(vadd(b, vadd(vmul(u, cs * r2), vmul(v, sn * r2))));
+    }
+    for (let i = 0; i < sides; i++) addUFace(out, [ A[i], A[(i + 1) % sides], B[(i + 1) % sides], B[i] ], color, yaw);
+    addUFace(out, [ ...A ].reverse(), color, yaw, vmul(d, -1));
+    addUFace(out, B, color, yaw, d);
+  }
+  function addBodyPod(out, cx, cz, lenY, lenX, h, color, yaw) {
+    const x0 = cx - lenX / 2, x1 = cx + lenX / 2, ry = lenY / 2, rz = h / 2;
+    const ring = (x, scale) => [ 0, 1, 2, 3, 4, 5 ].map(i => {
+      const a = i * TAU / 6 + Math.PI / 6;
+      return v3(x, Math.cos(a) * ry * scale, cz + Math.sin(a) * rz * scale);
+    });
+    const A = ring(x0, .82), B = ring(x1, .92);
+    for (let i = 0; i < 6; i++) addUFace(out, [ A[i], A[(i + 1) % 6], B[(i + 1) % 6], B[i] ], color, yaw);
+    addUFace(out, [ ...A ].reverse(), color, yaw);
+    addUFace(out, B, color, yaw);
+  }
+  function addHeadPod(out, cx, cz, len, w, h, color, yaw) {
+    const x0 = cx - len / 2, x1 = cx + len / 2, ry = w / 2, rz = h / 2;
+    const ring = (x, scale) => [ 0, 1, 2, 3, 4, 5 ].map(i => {
+      const a = i * TAU / 6 + Math.PI / 6;
+      return v3(x, Math.cos(a) * ry * scale, cz + Math.sin(a) * rz * scale);
+    });
+    const A = ring(x0, 1), B = ring(x1, .82);
+    for (let i = 0; i < 6; i++) addUFace(out, [ A[i], A[(i + 1) % 6], B[(i + 1) % 6], B[i] ], color, yaw);
+    addUFace(out, [ ...A ].reverse(), color, yaw);
+    addUFace(out, B, color, yaw);
+  }
+  function addEar(out, x, y, z, side, color, yaw) {
+    const b1 = v3(x - 3.2, y + side * 2.7, z - 2.2), b2 = v3(x + 2.3, y + side * 2.3, z - 1.8), b3 = v3(x - .4, y - side * .6, z + 1.2), tip = v3(x + 1.2, y + side * 3, z + 8.6);
+    addUFace(out, [ b1, b2, tip ], color, yaw);
+    addUFace(out, [ b2, b3, tip ], color, yaw);
+    addUFace(out, [ b3, b1, tip ], color, yaw);
+  }
+  function addManeFin(out, x, z, size, color, yaw) {
+    const y = .45;
+    addUFace(out, [ v3(x - 2.2, -y, z), v3(x + 2.2, -y, z), v3(x + .8, -y, z + size) ], color, yaw);
+    addUFace(out, [ v3(x + 2.2, y, z), v3(x - 2.2, y, z), v3(x + .8, y, z + size) ], color, yaw);
+    addUFace(out, [ v3(x - 2.2, -y, z), v3(x + .8, -y, z + size), v3(x + .8, y, z + size), v3(x - 2.2, y, z) ], color, yaw);
+    addUFace(out, [ v3(x + 2.2, y, z), v3(x + .8, y, z + size), v3(x + .8, -y, z + size), v3(x + 2.2, -y, z) ], color, yaw);
+  }
+  function addEye(out, x, y, z, side, yaw) {
+    const sy = side * (Math.abs(y) + .3), sz = z;
+    addUFace(out, [ v3(x - 1, sy, sz - 1), v3(x + 1, sy, sz - 1), v3(x + 1, sy, sz + 1), v3(x - 1, sy, sz + 1) ], "#26272c", yaw);
+  }
+  function unicornMesh(faces, yaw, zBob, gait, g, c, p) {
+    const [legTopR, legBotR, hoofTopR, hoofBotR, bodyLen, bodyWide, bodyH, coreLen, coreWide, coreH, neckR1, neckR2, headLen, headW, headH, muzzleLen, muzzleW, muzzleH, hornR, hornTipR, hornTipX, hornTipK, hornTipZ, eyeK, fin1, fin2, fin3, tailR1, tailR2, tailR3, tailR4] = g;
+    const [body, core, hoof, horn, finC1, finC2, finC3, tailC1, tailC2, tailC3] = c;
+    const [fwd, drop, neckDrop, muzzleDrop, hornBaseDrop, hornFwd, hornTipDrop, maneFwd, maneDrop, strideSwing, hoofLift, tailSwing] = p;
+    const legXs = [ -8.2, -8.2, 7.7, 7.7 ], legYs = [ -6.2, 6.2, -6.2, 6.2 ];
+    for (let i = 0; i < 4; i++) {
+      const phase = i === 0 || i === 3 ? gait : -gait;
+      const swing = phase * strideSwing;
+      const top = v3(legXs[i] + swing * .24, legYs[i], 17.6 + zBob);
+      const foot = v3(legXs[i] + swing * .92, legYs[i], 11.2 + zBob + Math.max(0, phase) * hoofLift);
+      addTube(faces, top, foot, legTopR, legBotR, 4, body, yaw, Math.PI / 4);
+      addTube(faces, v3(foot.x, foot.y, 11.2 + zBob), v3(foot.x + .7, foot.y, 7.1 + zBob), hoofTopR, hoofBotR, 4, hoof, yaw, Math.PI / 4);
+    }
+    addBodyPod(faces, -1.2, 23.6 + zBob, bodyLen, bodyWide, bodyH, body, yaw);
+    addBodyPod(faces, 3.2, 24.9 + zBob, coreLen, coreWide, coreH, core, yaw);
+    addTube(faces, v3(10.5 + fwd * .24, 0, 25.3 + zBob - neckDrop * .35), v3(14.3 + fwd * .55, 0, 33.1 + zBob - neckDrop), neckR1, neckR2, 6, body, yaw, Math.PI / 6);
+    addHeadPod(faces, 20.3 + fwd, 35.6 + zBob - drop, headLen, headW, headH, body, yaw);
+    addHeadPod(faces, 28.2 + fwd * 1.05, 33.6 + zBob - drop - muzzleDrop, muzzleLen, muzzleW, muzzleH, core, yaw);
+    addEar(faces, 17.4 + fwd * .92, -4, 40.6 + zBob - drop, -1, core, yaw);
+    addEar(faces, 17.4 + fwd * .92, 4, 40.6 + zBob - drop, 1, core, yaw);
+    addTube(faces, v3(28.2 + fwd * .98, 0, 40.4 + zBob - drop - hornBaseDrop), v3(hornTipX + fwd * hornTipK + hornFwd, 0, hornTipZ + zBob - drop - hornTipDrop), hornR, hornTipR, 5, horn, yaw, Math.PI / 5);
+    addManeFin(faces, 8.4 + maneFwd * .2, 33 + zBob - maneDrop * .25, fin1, finC1, yaw);
+    addManeFin(faces, 11.7 + maneFwd * .55, 35.9 + zBob - maneDrop * .72, fin2, finC2, yaw);
+    addManeFin(faces, 14.8 + maneFwd * .9, 38.2 + zBob - maneDrop, fin3, finC3, yaw);
+    addTube(faces, v3(-16.2, 0, 27.8 + zBob), v3(-23.8, tailSwing * .18, 27.2 + zBob), tailR1, tailR2, 5, tailC1, yaw, Math.PI / 5);
+    addTube(faces, v3(-23.8, tailSwing * .18, 27.2 + zBob), v3(-30.5, tailSwing * .38, 23.4 + zBob), tailR2, tailR3, 5, tailC2, yaw, Math.PI / 5);
+    addTube(faces, v3(-30.5, tailSwing * .38, 23.4 + zBob), v3(-36, tailSwing * .68, 18.6 + zBob), tailR3, tailR4, 5, tailC3, yaw, Math.PI / 5);
+    const eyeZ = 37 + zBob - drop - muzzleDrop * .45, eyeX = 25.8 + fwd * eyeK;
+    addEye(faces, eyeX, 8.5, eyeZ, 1, yaw);
+    addEye(faces, eyeX, 8.5, eyeZ, -1, yaw);
+    faces.sort((a, b) => a.depth - b.depth);
+    for (const f of faces) poly(f.pts.map(q => [ q.x, q.y ]), f.color);
+    return {
+      eyeX,
+      eyeZ
+    };
+  }
+  function drawUnicorn() {
+    const yaw = player.visualYaw;
+    uOriginX = player.x;
+    uOriginY = player.y;
+    uScaleMul = PLAYER_SCALE;
+    const s = worldToScreen(player.x, player.y), sprintA = clamp(player.sprintVisual, 0, 1), sprintPose = sprintA * sprintA * (3 - 2 * sprintA);
+    const gait = Math.sin(player.moveAnim), stride = player.strideAmt;
+    const bob = Math.sin(player.moveAnim * 2) * (.38 + .14 * stride + .08 * sprintA) * player.bob;
+    const hit = player.invuln > 0 && Math.floor(player.invuln * 24) % 2 === 0;
+    const ivory = hit ? "#ff9db1" : "#f4efe7", ivory2 = hit ? "#ffc7d2" : "#fffaf3", hoof = "#cfc6bd";
+    const pink = "#ff6f9e", blue = "#69d1ff", violet = "#9b79ff", gold = "#ffd35b";
+    shadow({
+      x: s.x,
+      y: s.y
+    }, (16.5 + sprintA * 2.5) * PLAYER_SCALE, .18);
+    const zBob = bob + sprintA * .35 - 10.4;
+    const headFwd = 10 * sprintPose, headDrop = 10.5 * sprintPose, muzzleDrop = 3.8 * sprintPose;
+    unicornMesh([], yaw, zBob, gait, [ 3.25, 2.95, 3.05, 3.25, 23, 31, 20, 16, 19, 13, 8.2, 6.8, 19, 17.5, 18.3, 11.5, 13.6, 10.8, 2.7, .22, 35.4, 1, 49.6, 1.02, 6.9, 6.9, 6.3, 2.4, 1.95, 1.38, .36 ], [ ivory, ivory2, hoof, gold, pink, blue, violet, pink, blue, violet ], [ headFwd, headDrop, 6 * sprintPose, muzzleDrop, 1.2 * sprintPose, 11 * sprintPose, 7 * sprintPose, 6.4 * sprintPose, 6 * sprintPose, (1.65 + 1.45 * stride) * player.bob, (.75 + 1.15 * stride) * player.bob, Math.sin(player.moveAnim * 1.05) * 2 * player.bob ]);
+    const nose = uScreen(v3(32.6 + headFwd * 1.08, 0, 33 + zBob - headDrop - muzzleDrop * .9), yaw);
+    ctx.fillStyle = "rgba(90,70,75,.55)";
+    ctx.beginPath();
+    ctx.arc(nose.x, nose.y, 1.2, 0, TAU);
+    ctx.fill();
+  }
+  const BOSS_SCALE = 2.4;
+  function drawBossUnicorn(e) {
+    const yaw = e.visualYaw;
+    const s = worldToScreen(e.x, e.y);
+    const gait = Math.sin(e.animT * 4), bob = Math.sin(e.animT * 8) * .5;
+    const windup = e.chargeState === "windup" ? 1 - clamp(e.chargeTimer / .6, 0, 1) : 0;
+    const falling = e.entry === "fall";
+    if (!falling && e.chargeState === "windup") {
+      const end = worldToScreen(e.x + e.chargeVX * 230, e.y + e.chargeVY * 230);
+      ctx.save();
+      ctx.setLineDash([ 11, 7 ]);
+      ctx.strokeStyle = "rgba(255,40,80,.85)";
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      ctx.fillStyle = "#ff2850";
+      ctx.font = "bold 26px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("!", s.x, s.y - 92);
+    }
+    uOriginX = e.x;
+    uOriginY = e.y;
+    uScaleMul = BOSS_SCALE;
+    let tint = null, tintT = 0;
+    if (e.slow) {
+      tint = "#6fa8dc";
+      tintT = .52;
+    }
+    if (e.weak) {
+      tint = "#b06fd0";
+      tintT = .52;
+    }
+    const T_ = c => tint ? mixHex(c, tint, tintT) : c;
+    const dark = T_("#1c1418"), dark2 = T_("#120d10"), hoof = T_("#0c0a0b"), horn = "#ffd35b", mane = "#ff2d55", eyeGlow = "#ff3d3d";
+    const fallQ = falling ? clamp(e.fallZ / 820, 0, 1) : 0;
+    shadow(s, 30 * (1 - fallQ * .62), .22 * (1 - fallQ * .55));
+    ctx.save();
+    if (falling) ctx.translate(0, -e.fallZ);
+    const zBob = bob - 10.4, leanFwd = 8 * windup, leanDrop = 6 * windup;
+    const {eyeX, eyeZ} = unicornMesh([], yaw, zBob, gait, [ 3.6, 3.2, 3.4, 3.6, 25, 33, 22, 17, 20, 14, 8.6, 7.1, 20, 18.3, 19.2, 12, 14.2, 11.3, 3.1, .25, 37, 1.4, 52, 1, 7.6, 7.6, 7, 2.6, 2.1, 1.5, .4 ], [ dark, dark2, hoof, horn, mane, mane, mane, mane, dark, dark ], [ leanFwd, leanDrop, leanDrop, 0, 0, 0, 0, 0, 0, 2.4, 1.6, Math.sin(e.animT * 1.1) * 2 ]);
+    const eyeL = uScreen(v3(eyeX, 8.5, eyeZ), yaw), eyeR = uScreen(v3(eyeX, -8.5, eyeZ), yaw);
+    ctx.fillStyle = hexA(eyeGlow, .4);
+    ctx.beginPath();
+    ctx.arc(eyeL.x, eyeL.y, 4, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(eyeR.x, eyeR.y, 4, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = eyeGlow;
+    ctx.beginPath();
+    ctx.arc(eyeL.x, eyeL.y, 2, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(eyeR.x, eyeR.y, 2, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+    uOriginX = player.x;
+    uOriginY = player.y;
+    uScaleMul = 1;
+    if (!falling) {
+      const bw = 140, bh = 7, bx = s.x - bw / 2, by = s.y - 148, t = clamp(e.hp / e.maxHp, 0, 1);
+      ctx.fillStyle = "rgba(16,18,24,.78)";
+      ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+      ctx.fillStyle = "#3a3f49";
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.fillStyle = t > .5 ? "#68dc74" : t > .25 ? "#ffd35a" : "#ff5d68";
+      ctx.fillRect(bx, by, bw * t, bh);
+    }
+    if (!falling && (e.slow || e.weak)) {
+      const marks = [];
+      if (e.slow) marks.push([ "❄", "#d9f3ff" ]);
+      if (e.weak) marks.push([ "◉", "#f4d5ff" ]);
+      const step = 28, bw = marks.length * step + 10, gy = s.y - 172;
+      ctx.fillStyle = "rgba(14,16,22,.72)";
+      roundRect(s.x - bw / 2, gy - 20, bw, 28, 9);
+      ctx.fill();
+      ctx.textAlign = "center";
+      ctx.font = "19px sans-serif";
+      marks.forEach(([ch, col], i) => {
+        const mx = s.x - bw / 2 + 10 + i * step + step / 2 - 5;
+        ctx.fillStyle = col;
+        ctx.fillText(ch, mx, gy);
+      });
+    }
+  }
+  function drawEnemy(e) {
+    const s = worldToScreen(e.x, e.y), slow = e.slow, weak = e.weak, S = e.elite ? 1.5 : 1;
+    if (e.type === "charger" && e.chargeState === "windup") {
+      const end = worldToScreen(e.x + e.chargeVX * 160, e.y + e.chargeVY * 160);
+      ctx.save();
+      ctx.setLineDash([ 7, 5 ]);
+      ctx.strokeStyle = "rgba(255,111,73,.72)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+    shadow(s, e.r, .18);
+    ctx.save();
+    ctx.translate(s.x, s.y - 9 * S);
+    ctx.scale(S, S);
+    let base = e.hitFlash > 0 ? "#ffffff" : e.type === "ranged" ? "#4c3b68" : e.type === "charger" ? "#925143" : e.type === "runner" ? "#4fb0a8" : "#66514d";
+    if (slow) base = "#5e8bb9";
+    if (weak) base = "#7f4f91";
+    if (e.type === "melee") {
+      poly(ngon(13, 10), base);
+      poly([ [ -7.6, -10.5 ], [ -3.8, -20.8 ], [ 0, -13 ] ], "#8b6b61");
+      poly([ [ 0, -13 ], [ 3.8, -20.8 ], [ 7.6, -10.5 ] ], "#8b6b61");
+      ctx.fillStyle = "#ff785e";
+      ctx.fillRect(-7, -7, 4, 3);
+      ctx.fillRect(4, -7, 4, 3);
+    } else if (e.type === "ranged") {
+      poly(ngon(15, 6, Math.PI / 6), base);
+      poly([ [ -6, -13 ], [ -4, -23 ], [ -2, -13 ] ], "#2e253c");
+      poly([ [ 2, -13 ], [ 4, -23 ], [ 6, -13 ] ], "#2e253c");
+      ctx.fillStyle = "#f0b5ff";
+      ctx.fillRect(-6, -8, 4, 3);
+      ctx.fillRect(3, -8, 4, 3);
+    } else if (e.type === "charger") {
+      poly(ngon(18, 5), base);
+      poly([ [ -6.5, -13.3 ], [ -3.3, -25.7 ], [ 0, -18 ] ], "#d77b5c");
+      poly([ [ 0, -18 ], [ 3.3, -25.7 ], [ 6.5, -13.3 ] ], "#d77b5c");
+      ctx.fillStyle = "#ffb15c";
+      ctx.fillRect(-6, -9, 4, 3);
+      ctx.fillRect(3, -9, 4, 3);
+      if (e.chargeState === "windup") {
+        ctx.fillStyle = "#ffcf65";
+        ctx.font = "bold 18px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText("!", 0, -29);
+      }
+      if (e.chargeState === "charge") {
+        ctx.strokeStyle = "rgba(255,190,120,.8)";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(-20, 2);
+        ctx.lineTo(-31, 2);
+        ctx.moveTo(-18, 9);
+        ctx.lineTo(-27, 13);
+        ctx.stroke();
+      }
+    } else if (e.type === "runner") {
+      poly(ngon(13, 3).map(([x, y]) => [ x * .9, y * .8 ]), base);
+      poly([ [ -3.3, -5.4 ], [ -1.7, -14.9 ], [ 0, -10.4 ] ], "#2f7d78");
+      poly([ [ 0, -10.4 ], [ 1.7, -14.9 ], [ 3.3, -5.4 ] ], "#2f7d78");
+      ctx.fillStyle = "#d8fff6";
+      ctx.fillRect(-6, -6, 4, 3);
+      ctx.fillRect(3, -6, 4, 3);
+      ctx.strokeStyle = "rgba(190,255,246,.55)";
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(-15, -2);
+      ctx.lineTo(-25, -2);
+      ctx.moveTo(-14, 5);
+      ctx.lineTo(-22, 7);
+      ctx.stroke();
+    }
+    const statusY = e.type === "charger" ? -31 : e.type === "runner" ? -23 : -26;
+    if (slow) {
+      ctx.fillStyle = "#d9f3ff";
+      ctx.font = "14px sans-serif";
+      ctx.fillText("❄", -5, statusY);
+    }
+    if (weak) {
+      ctx.fillStyle = "#f4d5ff";
+      ctx.font = "15px sans-serif";
+      ctx.fillText("◉", -5, statusY);
+    }
+    ctx.restore();
+    const bw = (e.type === "charger" ? 39 : e.type === "ranged" ? 32 : e.type === "runner" ? 28 : 36) * S, bh = 5, bx = s.x - bw / 2;
+    const by = s.y - (e.type === "charger" ? 47 : e.type === "runner" ? 38 : 43) * S;
+    ctx.fillStyle = "rgba(16,18,24,.78)";
+    ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+    ctx.fillStyle = "#3a3f49";
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = e.hp / e.maxHp > .5 ? "#68dc74" : e.hp / e.maxHp > .25 ? "#ffd35a" : "#ff5d68";
+    ctx.fillRect(bx, by, bw * clamp(e.hp / e.maxHp, 0, 1), bh);
+  }
+  function drawTrail(t) {
+    if (t.points.length < 2) return;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const col = COLORS[t.color].key;
+    const alpha = clamp(t.life / 1.4, 0, 1);
+    if (t.color === 5) {
+      drawIndigoTrail(t, col, alpha);
+      ctx.restore();
+      return;
+    }
+    ctx.strokeStyle = hexA(col, .18 * alpha);
+    ctx.lineWidth = t.color === 0 ? 23 : 19;
+    ctx.beginPath();
+    t.points.forEach((p, i) => {
+      let s = worldToScreen(p.x, p.y);
+      i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y);
+    });
+    ctx.stroke();
+    ctx.strokeStyle = hexA(col, .92 * alpha);
+    ctx.lineWidth = t.color === 0 ? 10 : 7;
+    ctx.beginPath();
+    t.points.forEach((p, i) => {
+      let s = worldToScreen(p.x, p.y);
+      i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y);
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawIndigoTrail(t, col, alpha) {
+    const pts = t.points, max = t.blockMax || 1;
+    let i = 1;
+    while (i < pts.length) {
+      const h = indigoSegHp(t, i - 1) || 0;
+      if (h <= 0) {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j + 1 < pts.length && indigoSegHp(t, j) === h) j++;
+      const f = alpha * (.42 + .58 * clamp(h / max, 0, 1));
+      ctx.beginPath();
+      for (let k = i - 1; k <= j; k++) {
+        const s = worldToScreen(pts[k].x, pts[k].y);
+        k === i - 1 ? ctx.moveTo(s.x, s.y) : ctx.lineTo(s.x, s.y);
+      }
+      ctx.strokeStyle = hexA(col, .18 * f);
+      ctx.lineWidth = 19;
+      ctx.stroke();
+      ctx.strokeStyle = hexA(col, .92 * f);
+      ctx.lineWidth = 7;
+      ctx.stroke();
+      ctx.setLineDash([ 7, 7 ]);
+      ctx.strokeStyle = hexA("#dce3ff", .8 * f);
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      i = j + 1;
+    }
+  }
+  function drawGust(g) {
+    const age = 1 - g.life / g.maxLife;
+    const fade = Math.min(clamp(age / .25, 0, 1), clamp((1 - age) / .35, 0, 1));
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineCap = "round";
+    for (const q of g.lines) {
+      const a = worldToScreen(q.a.x, q.a.y, q.a.z), b = worldToScreen(q.b.x, q.b.y, q.b.z);
+      ctx.strokeStyle = `rgba(255,255,255,${q.alpha * fade})`;
+      ctx.lineWidth = q.lw;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawRainbowIcon(x, y, r = 14.4, w = 3.5) {
+    ctx.lineWidth = w;
+    for (let i = 0; i < 4; i++) {
+      ctx.strokeStyle = COLORS[i * 2].key;
+      ctx.beginPath();
+      ctx.arc(x, y, r - i * w, Math.PI, TAU);
+      ctx.stroke();
+    }
+  }
+  function drawPickup(p) {
+    let s = worldToScreen(p.x, p.y);
+    if (p.type === "xp") {
+      const R = 4;
+      const col = p.v < 5 ? "#62c7ff" : p.v < 8 ? "#3fd6c9" : p.v < 13 ? "#a97bff" : p.v < 22 ? "#ffd35a" : "#ff6fd8";
+      shadow(s, R + 1, .1);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y - 5, R, 0, TAU);
+      ctx.fill();
+    } else if (p.type === "heart") {
+      shadow(s, 11, .1);
+      const hx = s.x, hy = s.y - 11, R = 8;
+      ctx.fillStyle = "#ff5d78";
+      ctx.beginPath();
+      ctx.arc(hx - R * .52, hy - R * .34, R * .62, 0, TAU);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(hx + R * .52, hy - R * .34, R * .62, 0, TAU);
+      ctx.fill();
+      poly([ [ hx - R * 1.1, hy - R * .18 ], [ hx + R * 1.1, hy - R * .18 ], [ hx, hy + R * 1.25 ] ], "#ff5d78");
+    } else {
+      shadow(s, 13, .1);
+      drawRainbowIcon(s.x, s.y + 1);
+    }
+  }
+  function drawProjectile(p) {
+    let s = worldToScreen(p.x, p.y, p.z);
+    if (p.rainbow) {
+      ctx.fillStyle = "rgba(255,255,255,.3)";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, p.r + 1, 0, TAU);
+      ctx.fill();
+      for (let i = 0; i < 3; i++) {
+        const col = COLORS[Math.floor((p.hue + i * 70) / 360 * 7) % 7].key;
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, p.r * (.78 - i * .22), 0, TAU);
+        ctx.fill();
+      }
+      return;
+    }
+    ctx.fillStyle = "rgba(240,140,255,.35)";
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 9, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = "#f08cff";
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 5, 0, TAU);
+    ctx.fill();
+  }
+  function drawBurst(b) {
+    let q = b.t / b.d, r = lerp(b.r, b.maxR, q), s = worldToScreen(b.x, b.y);
+    ctx.strokeStyle = hexA(b.color, 1 - q);
+    ctx.lineWidth = lerp(5, 1, q);
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, TAU);
+    ctx.stroke();
+  }
+  function drawFloater(f) {
+    let s = worldToScreen(f.x, f.y, f.z);
+    ctx.globalAlpha = 1 - f.t / .7;
+    ctx.font = "bold 15px system-ui";
+    ctx.textAlign = "center";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#000";
+    ctx.strokeText(f.text, s.x, s.y);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, s.x, s.y);
+    ctx.globalAlpha = 1;
+  }
+  function drawGround() {
+    ctx.fillStyle = "#7f9a69";
+    ctx.fillRect(-40, -40, W + 80, H + 80);
+    const step = 120, rad = 900;
+    ctx.strokeStyle = "rgba(255,255,255,.035)";
+    ctx.lineWidth = 1;
+    for (let gx = Math.floor((cam.x - rad) / step) * step; gx < cam.x + rad; gx += step) {
+      ctx.beginPath();
+      for (let gy = cam.y - rad, i = 0; gy <= cam.y + rad; gy += step, i++) {
+        let s = worldToScreen(gx, gy);
+        i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y);
+      }
+      ctx.stroke();
+    }
+    for (let gy = Math.floor((cam.y - rad) / step) * step; gy < cam.y + rad; gy += step) {
+      ctx.beginPath();
+      for (let gx = cam.x - rad, i = 0; gx <= cam.x + rad; gx += step, i++) {
+        let s = worldToScreen(gx, gy);
+        i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y);
+      }
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    for (let i = 0; i <= 64; i++) {
+      const a = i / 64 * TAU, s2 = worldToScreen(Math.cos(a) * MAP_RADIUS, Math.sin(a) * MAP_RADIUS);
+      i ? ctx.lineTo(s2.x, s2.y) : ctx.moveTo(s2.x, s2.y);
+    }
+    ctx.closePath();
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = hexA("#ffb020", .18);
+    ctx.stroke();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = hexA("#ffb020", .75);
+    ctx.stroke();
+  }
+  function rainbowGradient(x, y, w, phase = 0) {
+    const g = ctx.createLinearGradient(x, y, x + w, y);
+    const hues = [ 0, 35, 58, 125, 195, 235, 280, 330, 360 ];
+    for (let i = 0; i < hues.length; i++) {
+      const pos = i / (hues.length - 1);
+      const h = (hues[i] + phase) % 360;
+      g.addColorStop(pos, `hsl(${h} 88% 62%)`);
+    }
+    return g;
+  }
+  function addShake(mag, dur) {
+    const live = shakeDur > 0 ? shakeMag * (shakeT / shakeDur) : 0;
+    if (mag >= live) {
+      shakeMag = mag;
+      shakeDur = dur;
+      shakeT = dur;
+      shakePhase = rnd(0, TAU);
+    }
+  }
+  function freeze(d) {
+    hitStop = Math.max(hitStop, d);
+  }
+  function updateScreenFx(dt) {
+    flashT = Math.max(0, flashT - dt);
+    if (shakeT > 0) {
+      shakeT = Math.max(0, shakeT - dt);
+      const q = shakeDur > 0 ? shakeT / shakeDur : 0, amp = Math.min(SHAKE_MAX, shakeMag * q * q), el = shakeDur - shakeT;
+      shakeX = clamp(Math.cos(shakePhase + el * 47) * amp, -SHAKE_MAX, SHAKE_MAX);
+      shakeY = clamp(Math.sin(shakePhase * 1.7 + el * 59) * amp * .72, -SHAKE_MAX, SHAKE_MAX);
+      if (shakeT <= 0) {
+        shakeX = shakeY = 0;
+        shakeMag = 0;
+        shakeDur = 0;
+      }
+    }
+  }
+  function updateConfetti(dt) {
+    const celebrating = paused && !dead && menuCloseAt < 0;
+    if (celebrating) {
+      confettiEmit += dt;
+      const gap = 1 / 55;
+      while (confettiEmit >= gap) {
+        confettiEmit -= gap;
+        if (confetti.length < CONFETTI_CAP) spawnConfettiPiece(-rnd(10, 40));
+      }
+    } else confettiEmit = 0;
+    for (let i = confetti.length - 1; i >= 0; i--) {
+      const p = confetti[i];
+      p.t += dt;
+      if (p.t > p.d || p.y > H + 30) {
+        confetti.splice(i, 1);
+        continue;
+      }
+      p.vy += 90 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+    }
+  }
+  function drawConfetti() {
+    const exitFade = menuCloseAt >= 0 ? 1 - clamp((performance.now() - menuCloseAt) / 1e3 / MENU_OUT, 0, 1) : 1;
+    confetti.forEach(p => {
+      const a = clamp((H - p.y) / 70, 0, 1) * exitFade;
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      ctx.restore();
+    });
+  }
+  function drawUI() {
+    ctx.textAlign = "left";
+    ctx.font = "13px system-ui";
+    if (flashT > 0) {
+      const a = flashT / FLASH_D;
+      ctx.fillStyle = `rgba(255,52,72,${(.3 * a * a).toFixed(3)})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    const upgrading = paused && levelChoices.length > 0;
+    const xpT = upgrading ? 1 : clamp(player.xp / player.xpNext, 0, 1);
+    const levelFxElapsed = (performance.now() - levelFxStart) / 1e3;
+    const levelPhase = upgrading ? performance.now() / 1e3 * 150 % 360 : levelFxElapsed >= 0 && levelFxElapsed < 1.15 ? levelFxElapsed * 420 : 0;
+    ctx.fillStyle = "rgba(18,20,28,.94)";
+    ctx.fillRect(0, 0, W, 16);
+    if (xpT > 0) {
+      ctx.fillStyle = rainbowGradient(0, 0, W, levelPhase);
+      ctx.fillRect(0, 0, W * xpT, 16);
+    }
+    ctx.fillStyle = "rgba(255,255,255,.18)";
+    ctx.fillRect(0, 15, W, 1);
+    ctx.textAlign = "center";
+    ctx.font = "700 12px system-ui";
+    ctx.fillStyle = "rgba(0,0,0,.55)";
+    ctx.fillText(`LV ${player.level}`, W * .5, 12.5);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(`LV ${player.level}`, W * .5, 11.5);
+    ctx.font = "700 13px system-ui";
+    ctx.fillStyle = "rgba(18,20,28,.82)";
+    roundRect(W * .5 - 40, 22, 80, 22, 11);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.fillText(fmtTime(gameTime), W * .5, 37);
+    const lx = 14, ly = H - 70, lw = 230, lh = 60;
+    panel(lx, ly, lw, lh);
+    const regenning = !dead && !paused && player.hp < player.maxHp && player.noHitTime > REGEN_DELAY;
+    drawPlusIcon(lx + 26, ly + 18, 7, regenning ? "#68dc74" : "#ff596d");
+    bar(lx + 46, ly + 10, lw - 60, 16, player.hp / player.maxHp, "#ff596d", `${Math.ceil(player.hp)} / ${player.maxHp}`);
+    drawWindIcon(lx + 26, ly + 42, 7, "#53e1df");
+    bar(lx + 46, ly + 34, lw - 60, 16, player.stamina / player.maxStamina, "#53e1df", `${Math.ceil(player.stamina)} / ${player.maxStamina}`);
+    const pw = 320, ph = 100, px = W - pw - 14, py = H - ph - 14;
+    panel(px, py, pw, ph);
+    bar(px + 16, py + 14, pw - 32, 17, player.paint / player.maxPaint, COLORS[selected].key, `${Math.floor(player.paint)} / ${player.maxPaint}`);
+    const gap = 38, cy = py + 66, cx = px + pw / 2 - 3 * gap;
+    ctx.fillStyle = COLORS[selected].key;
+    ctx.font = "700 11px system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText(COLORS[selected].role, cx + selected * gap, py + 49);
+    for (let i = 0; i < 7; i++) {
+      ctx.beginPath();
+      ctx.arc(cx + i * gap, cy, selected === i ? 12 : 10, 0, TAU);
+      ctx.fillStyle = COLORS[i].key;
+      ctx.fill();
+      if (selected === i) {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+      ctx.fillStyle = "rgba(255,255,255,.82)";
+      ctx.font = "10px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText(String(i + 1), cx + i * gap, cy + 27);
+    }
+    if (started) drawHint();
+    if (!started) drawStart();
+    if (levelChoices.length) drawUpgradeMenu();
+    if (dead) drawDeath();
+    drawConfetti();
+  }
+  const fmtTime = t => `${t / 60 | 0}:${("" + (100 + t % 60 | 0)).slice(1)}`;
+  const HINT = [ "WASD move", "Hold Space sprint", "Hold LMB draw", "1–7 / wheel change color", "R restart" ];
+  function drawHint() {
+    ctx.font = "11px system-ui";
+    ctx.textAlign = "left";
+    HINT.forEach((line, i) => {
+      const y = 32 + i * 14;
+      ctx.fillStyle = "rgba(0,0,0,.45)";
+      ctx.fillText(line, 15, y + 1);
+      ctx.fillStyle = "rgba(255,255,255,.85)";
+      ctx.fillText(line, 14, y);
+    });
+  }
+  function drawPlusIcon(cx, cy, r, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(cx - r, cy - r * .32, r * 2, r * .64);
+    ctx.fillRect(cx - r * .32, cy - r, r * .64, r * 2);
+  }
+  function drawWindIcon(cx, cy, r, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(cx - r, cy - 4);
+    ctx.lineTo(cx + r * .6, cy - 4);
+    ctx.moveTo(cx - r, cy);
+    ctx.lineTo(cx + r, cy);
+    ctx.moveTo(cx - r, cy + 4);
+    ctx.lineTo(cx + r * .4, cy + 4);
+    ctx.stroke();
+  }
+  function panel(x, y, w, h) {
+    ctx.fillStyle = "rgba(19,22,30,.78)";
+    roundRect(x, y, w, h, 12);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.1)";
+    ctx.stroke();
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, r);
+  }
+  function bar(x, y, w, h, t, color, text, center = false) {
+    ctx.fillStyle = "#303646";
+    roundRect(x, y, w, h, 7);
+    ctx.fill();
+    ctx.fillStyle = color;
+    roundRect(x, y, w * clamp(t, 0, 1), h, 7);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.font = "12px system-ui";
+    ctx.textAlign = center ? "center" : "left";
+    ctx.fillText(text, center ? x + w / 2 : x + 7, y + h - 3);
+  }
+  function drawCardIcon(kind, cx, cy, r, color) {
+    const G = (n, rot = 0, k = .8) => poly(ngon(r * k, n, rot).map(([x, y]) => [ cx + x, cy + y ]), color);
+    if (!kind) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * .62, 0, TAU);
+      ctx.fill();
+    } else if (kind === 1) G(3, Math.PI / 2); else if (kind === 2) drawPlusIcon(cx, cy, r, color); else if (kind === 3) drawWindIcon(cx, cy, r, color); else if (kind === 4) drawRainbowIcon(cx, cy + 5, r * .85, r * .2); else if (kind === 5) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * .62, 0, TAU);
+      ctx.stroke();
+    } else G(6, Math.PI / 6);
+  }
+  function menuPhase() {
+    if (menuCloseAt >= 0) return 1 - clamp((performance.now() - menuCloseAt) / 1e3 / MENU_OUT, 0, 1);
+    if (menuOpenAt < 0) return 1;
+    return clamp((performance.now() - menuOpenAt) / 1e3 / MENU_IN, 0, 1);
+  }
+  const easeOut = q => 1 - (1 - q) * (1 - q) * (1 - q);
+  function drawUpgradeMenu() {
+    const raw = menuPhase(), closing = menuCloseAt >= 0, q = easeOut(raw);
+    ctx.save();
+    ctx.fillStyle = `rgba(12,14,20,${(.72 * q).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    const fx = (performance.now() - levelFxStart) / 1e3;
+    const titleY = H * .27 + (1 - q) * (closing ? -16 : 22);
+    ctx.save();
+    ctx.globalAlpha = q;
+    ctx.fillStyle = rainbowGradient(W / 2 - 90, titleY - 28, 180, fx * 420);
+    ctx.font = "700 30px system-ui";
+    ctx.fillText("LEVEL UP", W / 2, titleY);
+    ctx.globalAlpha = q * clamp(raw * 1.6 - .4, 0, 1);
+    ctx.font = "14px system-ui";
+    ctx.fillStyle = "#cfd4df";
+    ctx.fillText("Choose an upgrade — press 1, 2 or 3", W / 2, titleY + 28);
+    ctx.restore();
+    const cw = 200, ch = 152, gap = 15, y0 = H * .37;
+    levelChoices.forEach((u, i) => {
+      const delay = closing ? 0 : i * .06;
+      const cq = easeOut(clamp((raw - delay) / Math.max(.001, 1 - delay), 0, 1));
+      const chosen = closing && i === menuChosen;
+      const alpha = closing ? chosen ? cq : cq * cq : cq;
+      if (alpha <= .002) return;
+      const scale = chosen ? 1 + (1 - cq) * .14 : 1;
+      const dy = (1 - cq) * (closing ? chosen ? -10 : 34 : 26);
+      const x = W / 2 - (cw * 3 + gap * 2) / 2 + i * (cw + gap), y = y0 + dy;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      if (scale !== 1) {
+        const mx = x + cw / 2, my = y + ch / 2;
+        ctx.translate(mx, my);
+        ctx.scale(scale, scale);
+        ctx.translate(-mx, -my);
+      }
+      panel(x, y, cw, ch);
+      ctx.strokeStyle = u.rarity.color;
+      ctx.lineWidth = 2.5;
+      roundRect(x, y, cw, ch, 12);
+      ctx.stroke();
+      ctx.fillStyle = hexA(u.rarity.color, .1);
+      roundRect(x, y, cw, ch, 12);
+      ctx.fill();
+      ctx.textAlign = "center";
+      ctx.fillStyle = "rgba(255,255,255,.5)";
+      ctx.font = "700 12px system-ui";
+      ctx.fillText(`${i + 1}`, x + 16, y + 22);
+      ctx.fillStyle = u.rarity.color;
+      ctx.font = "700 10px system-ui";
+      ctx.fillText(u.rarity.name, x + cw / 2, y + 20);
+      drawCardIcon(u.def.icon, x + cw / 2, y + 62, 19, u.def.color);
+      ctx.fillStyle = "#fff";
+      ctx.font = "700 15px system-ui";
+      ctx.fillText(u.def.name, x + cw / 2, y + 109);
+      ctx.fillStyle = u.def.color;
+      ctx.font = "700 22px system-ui";
+      ctx.fillText(u.text, x + cw / 2, y + 136);
+      ctx.restore();
+    });
+    ctx.restore();
+  }
+  const ABOUT = [ "Fight by sprinting into enemies or drawing rainbow trails.", "Each rainbow color has a different effect.", "Survive 8 minutes, defeat the Boss, then keep going." ];
+  function drawStart() {
+    ctx.fillStyle = "rgba(10,12,18,.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = rainbowGradient(W / 2 - 190, H * .2 - 40, 380, performance.now() / 1e3 * 150 % 360);
+    ctx.font = "700 40px system-ui";
+    ctx.fillText("RAINBOW SURVIVORS", W / 2, H * .2);
+    ctx.fillStyle = "#cfd4df";
+    ctx.font = "15px system-ui";
+    ABOUT.forEach((line, i) => ctx.fillText(line, W / 2, H * .2 + 44 + i * 24));
+    ctx.fillStyle = "rgba(255,255,255,.72)";
+    ctx.font = "13px system-ui";
+    HINT.forEach((line, i) => ctx.fillText(line, W / 2, H * .53 + i * 20));
+    ctx.fillStyle = "#fff";
+    ctx.font = "700 20px system-ui";
+    ctx.fillText("Click to start", W / 2, H * .88);
+  }
+  function drawDeath() {
+    ctx.fillStyle = "rgba(10,12,18,.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "700 38px system-ui";
+    ctx.fillText(`YOU SURVIVED ${fmtTime(gameTime)}`, W / 2, H * .42);
+    ctx.font = "16px system-ui";
+    ctx.fillText(`Level ${player.level} · ${killCount} Kills`, W / 2, H * .42 + 34);
+    ctx.fillText("Press R to restart", W / 2, H * .42 + 66);
+  }
+  function render() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, VW, VH);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);
+    ctx.clip();
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+    drawGround();
+    trails.forEach(drawTrail);
+    gusts.forEach(drawGust);
+    pickups.forEach(drawPickup);
+    const visibles = props.filter(o => Math.abs(o.x - player.x) < 900 && Math.abs(o.y - player.y) < 900);
+    const worldObjects = [ ...visibles.map(o => ({
+      kind: "prop",
+      o,
+      depth: o.x + o.y
+    })), ...enemies.map(e => ({
+      kind: "e",
+      o: e,
+      depth: e.x + e.y
+    })), {
+      kind: "p",
+      o: player,
+      depth: player.x + player.y
+    } ].sort((a, b) => a.depth - b.depth);
+    worldObjects.forEach(a => a.kind === "prop" ? drawProp(a.o) : a.kind === "p" ? drawUnicorn() : a.o.type === "boss" ? drawBossUnicorn(a.o) : drawEnemy(a.o));
+    projectiles.forEach(drawProjectile);
+    bursts.forEach(drawBurst);
+    floaters.forEach(drawFloater);
+    ctx.restore();
+    drawUI();
+    ctx.restore();
+  }
+  let last = performance.now();
+  function frame(now) {
+    let dt = Math.min(.033, (now - last) / 1e3);
+    last = now;
+    updateScreenFx(dt);
+    updateConfetti(dt);
+    updateMenuAnim();
+    if (hitStop > 0) {
+      const use = Math.min(hitStop, dt);
+      hitStop -= use;
+      dt -= use;
+    }
+    if (dt > 0) update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
