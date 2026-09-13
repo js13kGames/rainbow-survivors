@@ -111,13 +111,11 @@
     key: "#a74ee8",
     role: "Weaken"
   } ];
-  const XP_CAP = 16;
   const BOSS_TIME = 480;
   const MAP_RADIUS = 1500;
   const TRASH_DESPAWN = 1500, BOSS_RECALL = 1800;
   const SPRINT_BOOST = 1.9, SPRINT_MAX = 3.6, SPRINT_ACCEL = .85;
   const SPRINT_STOP_MIN = 2.4;
-  const SPRINT_REHIT = .8;
   const KNOCK_RATIO = 5.4;
   const KNOCK_DECAY = .004;
   const KNOCK_STOP = 4;
@@ -125,7 +123,7 @@
   const SHAKE_MAX = 22;
   const REGEN_DELAY = 4;
   const PLAYER_SCALE = 1.3;
-  const MENU_IN = .26, MENU_OUT = .3;
+  const MENU_IN = 260, MENU_OUT = 300;
   let keys = new Set, mouse = {
     x: 0,
     y: 0,
@@ -140,6 +138,7 @@
   let hitStop = 0, flashT = 0, confettiEmit = 0;
   let shakeX = 0, shakeY = 0, shakeMag = 0, shakeT = 0, shakeDur = 0, shakePhase = 0;
   let menuOpenAt = -1, menuCloseAt = -1, menuChosen = -1;
+  let restartConfirmUntil = 0, bossDefeatUntil = 0;
   const player = {
     x: 0,
     y: 0,
@@ -151,12 +150,11 @@
     faceY: 0,
     paint: 100,
     maxPaint: 100,
-    paintRegen: 7,
+    paintRegen: 10,
     stamina: 50,
     maxStamina: 50,
     staminaDrain: 36,
     staminaRegen: 9,
-    sprintMult: 1,
     sprinting: false,
     sprintBlocked: false,
     sprintTime: 0,
@@ -164,8 +162,6 @@
     sprintMultCur: 1,
     sprintImpactCd: 0,
     sprintBurstDamage: 15,
-    sprintDps: 13,
-    _sprintHitAt: new Map,
     xp: 0,
     level: 1,
     xpNext: 18,
@@ -174,13 +170,14 @@
     hpRegen: 2.5,
     noHitTime: 0,
     redDps: 21.6,
-    orangeDamage: 18,
+    orangeDamage: 24,
     yellowBoost: .5,
     greenHps: 10,
     blueSlow: .48,
     violetAmp: .45,
     indigoHp: 3,
     magnet: 90,
+    brushSize: 1,
     moveAnim: 0,
     bob: 0,
     strideAmt: 0,
@@ -221,6 +218,8 @@
     menuOpenAt = -1;
     menuCloseAt = -1;
     menuChosen = -1;
+    restartConfirmUntil = 0;
+    bossDefeatUntil = 0;
     Object.assign(player, {
       x: 0,
       y: 0,
@@ -231,12 +230,11 @@
       faceY: 0,
       paint: 100,
       maxPaint: 100,
-      paintRegen: 7,
+      paintRegen: 10,
       stamina: 50,
       maxStamina: 50,
       staminaDrain: 36,
       staminaRegen: 9,
-      sprintMult: 1,
       sprinting: false,
       sprintBlocked: false,
       sprintTime: 0,
@@ -244,8 +242,6 @@
       sprintMultCur: 1,
       sprintImpactCd: 0,
       sprintBurstDamage: 15,
-      sprintDps: 13,
-      _sprintHitAt: new Map,
       xp: 0,
       level: 1,
       xpNext: 18,
@@ -254,13 +250,14 @@
       hpRegen: 2.5,
       noHitTime: 0,
       redDps: 21.6,
-      orangeDamage: 18,
+      orangeDamage: 24,
       yellowBoost: .5,
       greenHps: 10,
       blueSlow: .48,
       violetAmp: .45,
       indigoHp: 3,
       magnet: 90,
+      brushSize: 1,
       moveAnim: 0,
       bob: 0,
       strideAmt: 0,
@@ -313,12 +310,21 @@
   addEventListener("keydown", e => {
     keys.add(e.code);
     if (e.code === "Space") e.preventDefault();
-    if (started && e.code === "KeyR") reset();
+    if (started && e.code === "KeyR") {
+      if (e.repeat) return;
+      if (dead) {
+        reset();
+        return;
+      }
+      const now = performance.now();
+      if (now <= restartConfirmUntil) reset(); else restartConfirmUntil = now + 1e3;
+      return;
+    }
     if (paused && /^Digit[123]$/.test(e.code)) {
       chooseUpgrade(+e.code.slice(5) - 1);
     } else if (started && e.code.startsWith("Digit")) {
       let n = +e.code.slice(5);
-      if (n >= 1 && n <= 7) selected = n - 1;
+      if (n >= 1 && n <= 7) setColor(n - 1);
     }
   });
   addEventListener("keyup", e => {
@@ -336,7 +342,14 @@
       started = true;
       return;
     }
-    if (!paused && !dead) {
+    if (paused) {
+      if (menuCloseAt < 0) {
+        const p = toView(e.clientX, e.clientY), w = 200, g = 15, x = W / 2 - (w * 3 + g * 2) / 2, y = H * .37, i = (p.x - x) / (w + g) | 0;
+        if (i >= 0 && i < levelChoices.length && p.x >= x + i * (w + g) && p.x <= x + i * (w + g) + w && p.y >= y && p.y <= y + 152) chooseUpgrade(i);
+      }
+      return;
+    }
+    if (!dead) {
       const p = toView(e.clientX, e.clientY);
       mouse.x = p.x;
       mouse.y = p.y;
@@ -352,11 +365,18 @@
   });
   c.addEventListener("wheel", e => {
     e.preventDefault();
-    if (started) selected = (selected + (e.deltaY > 0 ? 1 : 6)) % 7;
+    if (started) setColor((selected + (e.deltaY > 0 ? 1 : 6)) % 7);
   }, {
     passive: false
   });
   let currentStroke = null;
+  function setColor(n) {
+    if (n === selected) return;
+    const d = mouse.down && !paused && !dead;
+    d && endStroke();
+    selected = n;
+    d && beginStroke();
+  }
   function beginStroke() {
     if (player.paint <= 0) return;
     const p = screenToWorld(mouse.x, mouse.y);
@@ -364,12 +384,13 @@
       color: selected,
       points: [ p ],
       life: player.rainbowLife,
-      exploded: false
+      exploded: false,
+      brush: player.brushSize
     };
     if (selected === 5) {
       currentStroke.blockHp = [];
       currentStroke.segBlock = [];
-      currentStroke.blockMax = player.indigoHp;
+      currentStroke.blockMax = Math.floor(player.indigoHp);
       currentStroke.blockAcc = 0;
     }
     trails.push(currentStroke);
@@ -421,27 +442,48 @@
   function blastOrange(t) {
     if (t.exploded) return;
     t.exploded = true;
-    const hitCounts = new Map, falloff = [ 1, .75, .55, .4 ];
+    const hitCounts = new Map, damageTotals = new Map, falloff = [ 1, .75, .55, .4 ], b = t.brush || 1;
     for (let i = 0; i < t.points.length; i += 2) {
       const p = t.points[i];
       bursts.push({
         x: p.x,
         y: p.y,
         r: 4,
-        maxR: 52,
+        maxR: 52 * b,
         t: 0,
         d: .34,
         color: COLORS[1].key
       });
       for (const e of [ ...enemies ]) {
-        const rr = 44 + e.r;
+        const rr = 44 * b + e.r;
         if ((e.x - p.x) ** 2 + (e.y - p.y) ** 2 < rr * rr) {
           const hits = hitCounts.get(e.id) || 0;
           const mult = hits < falloff.length ? falloff[hits] : .25;
           hitCounts.set(e.id, hits + 1);
-          damageEnemy(e, player.orangeDamage * .28 * mult, true);
+          const dealt = damageEnemy(e, player.orangeDamage * .28 * mult, true, false);
+          const total = damageTotals.get(e.id);
+          if (total) {
+            total.damage += dealt;
+            total.x = e.x;
+            total.y = e.y;
+          } else damageTotals.set(e.id, {
+            damage: dealt,
+            x: e.x,
+            y: e.y
+          });
         }
       }
+    }
+    for (const total of damageTotals.values()) {
+      const shown = Math.round(total.damage);
+      if (shown > 0) floaters.push({
+        x: total.x,
+        y: total.y,
+        z: 30,
+        t: 0,
+        text: shown,
+        color: COLORS[1].key
+      });
     }
   }
   const INDIGO_BLOCK = 60;
@@ -458,6 +500,7 @@
   }
   function indigoHitBlock(x, y, t, rad) {
     if (!t.segBlock) return -1;
+    rad += 8 * ((t.brush || 1) - 1);
     const pts = t.points;
     let best = -1, bestD = rad * rad;
     for (let i = 1; i < pts.length; i++) {
@@ -519,6 +562,7 @@
   function pointNearTrail(x, y, t, rad) {
     const pts = t.points;
     if (pts.length < 1) return false;
+    rad *= t.brush || 1;
     const r2 = rad * rad;
     for (let i = 1; i < pts.length; i++) {
       const a = pts[i - 1], b = pts[i], vx = b.x - a.x, vy = b.y - a.y, wx = x - a.x, wy = y - a.y;
@@ -534,7 +578,7 @@
   function spawnEnemy() {
     const a = rnd(0, TAU), ca = Math.cos(a), sa = Math.sin(a);
     const d = offscreenDist(ca, sa) + rnd(15, 90), roll = Math.random();
-    const table = [ [ "ranged", gameTime >= 30 ? .18 + Math.min(.14, (gameTime - 30) * .0028) : 0 ], [ "runner", gameTime >= 90 ? .12 : 0 ], [ "charger", gameTime >= 150 ? .13 : 0 ], [ "melee", gameTime >= 210 ? .04 : 0, 1 ], [ "ranged", gameTime >= 270 ? .04 : 0, 1 ], [ "runner", gameTime >= 330 ? .04 : 0, 1 ], [ "charger", gameTime >= 390 ? .04 : 0, 1 ] ];
+    const table = [ [ "ranged", gameTime >= 30 ? .12 : 0 ], [ "runner", gameTime >= 90 ? .12 : 0 ], [ "charger", gameTime >= 150 ? .13 : 0 ], [ "melee", gameTime >= 210 ? .04 : 0, 1 ], [ "ranged", gameTime >= 270 ? .04 : 0, 1 ], [ "runner", gameTime >= 330 ? .04 : 0, 1 ], [ "charger", gameTime >= 390 ? .04 : 0, 1 ] ];
     let type = "melee", elite = false, acc = 0;
     for (const [t, p, e] of table) {
       acc += p;
@@ -546,25 +590,25 @@
     }
     const stats = {
       melee: {
-        hp: 55,
+        hp: 41,
         r: 16,
         speed: 88,
         damage: 15
       },
       runner: {
-        hp: 30,
+        hp: 23,
         r: 12,
         speed: 165,
         damage: 14
       },
       ranged: {
-        hp: 42,
+        hp: 32,
         r: 14,
         speed: 67,
         damage: 11
       },
       charger: {
-        hp: 68,
+        hp: 51,
         r: 17,
         speed: 80,
         damage: 22
@@ -592,8 +636,6 @@
       ky: 0,
       redFloatTimer: 0,
       redFloatDamage: 0,
-      sprintFloatTimer: 0,
-      sprintFloatDamage: 0,
       onRed: false,
       chargeState: "chase",
       chargeTimer: 0,
@@ -610,7 +652,7 @@
   function spawnBoss() {
     const a = rnd(0, TAU), ca = Math.cos(a), sa = Math.sin(a);
     const dMax = inFrameDist(ca, sa), d = Math.max(Math.min(dMax, 140), dMax * rnd(.55, .95));
-    const hp = 4200;
+    const hp = 3e3;
     enemies.push({
       id: idCounter++,
       type: "boss",
@@ -628,8 +670,6 @@
       redFloatTimer: 0,
       redFloatDamage: 0,
       onRed: false,
-      sprintFloatTimer: 0,
-      sprintFloatDamage: 0,
       kx: 0,
       ky: 0,
       entry: "fall",
@@ -641,7 +681,7 @@
       chargeVX: 0,
       chargeVY: 0,
       chargeSpeed: 340,
-      rainbowCooldown: rnd(1, 5),
+      rainbowCooldown: rnd(2, 6),
       animT: 0,
       visualYaw: 0,
       gustTick: 0
@@ -666,7 +706,7 @@
   }
   function collectPickup(p) {
     if (p.type === "xp") {
-      gainXP(p.v);
+      gainXP(4);
       return;
     }
     if (p.type === "heart") {
@@ -691,29 +731,20 @@
       });
       return;
     }
-    player.paint = Math.min(player.maxPaint, player.paint + p.v);
-  }
-  function mergeOrSpawnXP(x, y, v) {
-    let count = 0, near = null, nearD = Infinity;
-    for (const p of pickups) {
-      if (p.type !== "xp") continue;
-      count++;
-      const d = len(x - p.x, y - p.y);
-      if (d < nearD) {
-        nearD = d;
-        near = p;
-      }
+    if (p.type === "magnet") {
+      for (const q of pickups) if (q.type === "xp") q.magnetized = true;
+      bursts.push({
+        x: p.x,
+        y: p.y,
+        r: 6,
+        maxR: 50,
+        t: 0,
+        d: .32,
+        color: "#7ee7ff"
+      });
+      return;
     }
-    if (count >= XP_CAP && near) {
-      near.v += v;
-      near.x = x;
-      near.y = y;
-    } else pickups.push({
-      type: "xp",
-      x,
-      y,
-      v
-    });
+    player.paint = Math.min(player.maxPaint, player.paint + p.v);
   }
   function killEnemy(e) {
     const idx = enemies.indexOf(e);
@@ -731,10 +762,15 @@
         color: i % 2 ? "#ffffff" : COLORS[i % 7].key
       });
       spawnConfetti();
+      bossDefeatUntil = performance.now() + 5e3;
       return;
     }
-    const xpValue = (e.type === "charger" ? 6 : e.type === "runner" ? 5 : 4) * (e.elite ? 2 : 1);
-    mergeOrSpawnXP(e.x + rnd(-5, 5), e.y + rnd(-5, 5), xpValue);
+    const xp = (e.type === "charger" ? 6 : e.type === "melee" ? 4 : 5) * (e.elite ? 2 : 1);
+    for (let n = xp / 4 + Math.random() | 0; n--; ) pickups.push({
+      type: "xp",
+      x: e.x + rnd(-8, 8),
+      y: e.y + rnd(-8, 8)
+    });
     if (Math.random() < .05) pickups.push({
       type: "paint",
       x: e.x + rnd(-14, 14),
@@ -746,6 +782,11 @@
       x: e.x + rnd(-16, 16),
       y: e.y + rnd(-16, 16),
       v: .12
+    });
+    if (Math.random() < .01) pickups.push({
+      type: "magnet",
+      x: e.x + rnd(-16, 16),
+      y: e.y + rnd(-16, 16)
     });
     bursts.push({
       x: e.x,
@@ -848,9 +889,9 @@
   }, {
     name: "Indigo Wall",
     color: COLORS[5].key,
-    fmt: "int",
-    amt: 1,
-    apply: v => player.indigoHp += Math.max(1, Math.round(v))
+    fmt: "dec",
+    amt: .5,
+    apply: v => player.indigoHp += v
   }, {
     name: "Violet Amp",
     color: COLORS[6].key,
@@ -858,14 +899,14 @@
     amt: .11,
     apply: v => player.violetAmp += v
   }, {
-    name: "Sprint",
+    name: "Speed",
     icon: 1,
-    color: "#7ef0ff",
+    color: "#fff",
     fmt: "pct",
     amt: .08,
-    apply: v => player.sprintMult *= 1 + v
+    apply: v => player.speed *= 1 + v
   }, {
-    name: "Vitality",
+    name: "Health",
     icon: 2,
     color: "#ff596d",
     fmt: "flat",
@@ -897,7 +938,7 @@
       const n = Math.round(v);
       player.maxPaint += n;
       player.paint += n;
-      player.paintRegen *= 1 + v / 90;
+      player.paintRegen *= 1 + v / 75;
     }
   }, {
     name: "Rainbow Time",
@@ -907,12 +948,12 @@
     amt: .14,
     apply: v => player.rainbowLife *= 1 + v
   }, {
-    name: "Magnet",
+    name: "Brush Size",
     icon: 6,
-    color: "#9fe36b",
-    fmt: "flat",
-    amt: 26,
-    apply: v => player.magnet += Math.round(v)
+    color: "#fff",
+    fmt: "pct",
+    amt: .12,
+    apply: v => player.brushSize *= 1 + v
   } ];
   function rollRarity() {
     let r = Math.random();
@@ -933,6 +974,7 @@
   }
   function fmtValue(fmt, v) {
     if (fmt === "pct") return "+" + Math.round(v * 100) + "%";
+    if (fmt === "dec") return "+" + v.toFixed(1);
     return "+" + Math.max(1, Math.round(v));
   }
   function makeChoices() {
@@ -947,14 +989,14 @@
     menuChosen = -1;
   }
   function chooseUpgrade(i) {
-    if (!paused || menuCloseAt >= 0 || !levelChoices[i]) return;
+    if (!paused || menuCloseAt >= 0 || !levelChoices[i] || performance.now() - menuOpenAt < 500) return;
     levelChoices[i].def.apply(levelChoices[i].value);
     menuChosen = i;
     menuCloseAt = performance.now();
   }
   function updateMenuAnim() {
     if (menuCloseAt < 0) return;
-    if ((performance.now() - menuCloseAt) / 1e3 < MENU_OUT) return;
+    if (performance.now() - menuCloseAt < MENU_OUT) return;
     paused = false;
     levelChoices = [];
     menuOpenAt = -1;
@@ -1052,14 +1094,13 @@
     if (player.sprinting) {
       if (!wasSprinting) {
         player.sprintTime = 0;
-        player._sprintHitAt = new Map;
         player.sprintWindTick = 0;
         player.sprintMultCur = SPRINT_BOOST;
       }
       player.sprintTime += dt;
       player.sprintMultCur = Math.min(SPRINT_MAX, player.sprintMultCur + SPRINT_ACCEL * dt);
-      speed *= player.sprintMultCur * player.sprintMult;
-      player.sprintSpeedRatio = speed / player.speed;
+      speed *= player.sprintMultCur;
+      player.sprintSpeedRatio = speed / 140;
       player.stamina = Math.max(0, player.stamina - player.staminaDrain * dt);
       if (player.stamina <= 0) {
         player.stamina = 0;
@@ -1084,62 +1125,38 @@
       player.x *= MAP_RADIUS / pd;
       player.y *= MAP_RADIUS / pd;
     }
-    if (player.sprinting) {
+    if (player.sprinting && player.sprintImpactCd <= 0 && player.sprintSpeedRatio >= SPRINT_BOOST) {
       for (const e of [ ...enemies ]) {
-        if (!enemies.includes(e)) continue;
-        if (e.entry === "fall") continue;
+        if (!enemies.includes(e) || e.entry === "fall") continue;
         const hitR = player.r + e.r + 9;
         if (dist2(player, e) >= hitR * hitR) continue;
-        const lastHit = player._sprintHitAt.get(e.id);
-        if ((lastHit === undefined || player.sprintTime - lastHit > SPRINT_REHIT) && player.sprintImpactCd <= 0) {
-          player._sprintHitAt.set(e.id, player.sprintTime);
-          player.sprintImpactCd = .4;
-          const impactScale = Math.max(1, player.sprintSpeedRatio);
-          const dealt = damageEnemy(e, player.sprintBurstDamage * impactScale, false, false);
-          if (enemies.includes(e)) {
-            const ox = e.x - player.x, oy = e.y - player.y;
-            const n = ox * ox + oy * oy > 1e-6 ? norm(ox, oy) : m;
-            const kq = clamp(impactScale, 1, SPRINT_MAX);
-            const v0 = e.speed * KNOCK_RATIO * lerp(.75, 1.25, (kq - 1) / (SPRINT_MAX - 1));
-            e.kx = n.x * v0;
-            e.ky = n.y * v0;
-            e.touch = Math.max(e.touch, .45);
-          }
-          floaters.push({
-            x: e.x,
-            y: e.y,
-            z: 34,
-            t: 0,
-            text: Math.round(dealt),
-            color: "#70efe9"
-          });
-          if (impactScale >= SPRINT_STOP_MIN) {
-            const q = clamp((impactScale - SPRINT_STOP_MIN) / (SPRINT_MAX - SPRINT_STOP_MIN), 0, 1);
-            freeze(lerp(.05, .11, q));
-            addShake(lerp(4, 8, q), .18);
-          }
-          player.sprintMultCur = Math.max(1, player.sprintMultCur * .7);
-        } else {
-          const impactScale = Math.max(1, player.sprintSpeedRatio);
-          const dealt = damageEnemy(e, player.sprintDps * impactScale * dt, false, false);
-          if (enemies.includes(e)) {
-            e.sprintFloatDamage += dealt;
-            e.sprintFloatTimer += dt;
-            if (e.sprintFloatTimer >= .28) {
-              const shown = Math.round(e.sprintFloatDamage);
-              if (shown > 0) floaters.push({
-                x: e.x,
-                y: e.y,
-                z: 30,
-                t: 0,
-                text: shown,
-                color: "#9ff6f2"
-              });
-              e.sprintFloatTimer = 0;
-              e.sprintFloatDamage = 0;
-            }
-          }
+        player.sprintImpactCd = .2;
+        const impactScale = player.sprintSpeedRatio;
+        const dealt = damageEnemy(e, player.sprintBurstDamage * impactScale, false, false);
+        if (enemies.includes(e)) {
+          const ox = e.x - player.x, oy = e.y - player.y;
+          const n = ox * ox + oy * oy > 1e-6 ? norm(ox, oy) : m;
+          const kq = clamp(impactScale, 1, SPRINT_MAX);
+          const v0 = e.speed * KNOCK_RATIO * lerp(.75, 1.25, (kq - 1) / (SPRINT_MAX - 1));
+          e.kx = n.x * v0;
+          e.ky = n.y * v0;
+          e.touch = Math.max(e.touch, .45);
         }
+        floaters.push({
+          x: e.x,
+          y: e.y,
+          z: 34,
+          t: 0,
+          text: Math.round(dealt),
+          color: "#70efe9"
+        });
+        if (impactScale >= SPRINT_STOP_MIN) {
+          const q = clamp((impactScale - SPRINT_STOP_MIN) / (SPRINT_MAX - SPRINT_STOP_MIN), 0, 1);
+          freeze(lerp(.05, .11, q));
+          addShake(lerp(4, 8, q), .18);
+        }
+        player.sprintMultCur = Math.max(1, player.sprintMultCur * .7);
+        break;
       }
     }
     if (player.sprinting) {
@@ -1228,7 +1245,7 @@
         e.x += nx * sp * dt;
         e.y += ny * sp * dt;
         resolvePropCollisions(e);
-        const wall = blockEnemyWithIndigo(e, ex, ey);
+        const wall = e.type === "runner" ? false : blockEnemyWithIndigo(e, ex, ey);
         if (!wall && d < e.r + player.r + 5 && e.touch <= 0) {
           hurtPlayer(e.damage);
           e.touch = .7;
@@ -1338,7 +1355,7 @@
             e.chargeVY = ny;
           } else if (e.rainbowCooldown <= 0 && d > 90) {
             shootBossRainbow(e);
-            e.rainbowCooldown = rnd(1, 5);
+            e.rainbowCooldown = rnd(2, 6);
           }
           if (!wall && d < e.r + player.r + 7 && e.touch <= 0) {
             hurtPlayer(e.damage * .5);
@@ -1351,7 +1368,7 @@
         e.x += e.kx * dt;
         e.y += e.ky * dt;
         resolvePropCollisions(e);
-        const wall = blockEnemyWithIndigo(e, px, py);
+        const wall = e.type === "runner" ? false : blockEnemyWithIndigo(e, px, py);
         if (wall || Math.hypot(e.x - px - e.kx * dt, e.y - py - e.ky * dt) > 1) {
           e.kx = 0;
           e.ky = 0;
@@ -1411,10 +1428,14 @@
     }
     for (let i = pickups.length - 1; i >= 0; i--) {
       const p = pickups[i], dx = player.x - p.x, dy = player.y - p.y, d = len(dx, dy);
-      if (d < player.magnet) {
-        const k = clamp(220 / d, 2, 8);
-        p.x += dx / d * 80 * k * dt;
-        p.y += dy / d * 80 * k * dt;
+      if (p.type === "xp" && p.magnetized) {
+        const k = clamp(360 / Math.max(d, 1), 3, 12);
+        p.x += dx / Math.max(d, 1) * 140 * k * dt;
+        p.y += dy / Math.max(d, 1) * 140 * k * dt;
+      } else if (d < player.magnet) {
+        const k = clamp(220 / Math.max(d, 1), 2, 8);
+        p.x += dx / Math.max(d, 1) * 80 * k * dt;
+        p.y += dy / Math.max(d, 1) * 80 * k * dt;
       }
       if (d < 24) {
         collectPickup(p);
@@ -1439,7 +1460,7 @@
     if (spawnTimer <= 0) {
       const prog = Math.min(1, gameTime / BOSS_TIME);
       if (enemies.length < 24 + prog * 56) spawnEnemy();
-      spawnTimer = 1 / (.9 + prog * 3.6);
+      spawnTimer = 1 / (.9 + prog * 2.7);
     }
     if (!bossSpawned && gameTime >= BOSS_TIME) {
       bossSpawned = true;
@@ -1783,6 +1804,10 @@
     uOriginY = e.y;
     uScaleMul = BOSS_SCALE;
     let tint = null, tintT = 0;
+    if (e.hitFlash > 0) {
+      tint = "#8f9399";
+      tintT = .58;
+    }
     if (e.slow) {
       tint = "#6fa8dc";
       tintT = .52;
@@ -1826,22 +1851,6 @@
       ctx.fillRect(bx, by, bw, bh);
       ctx.fillStyle = t > .5 ? "#68dc74" : t > .25 ? "#ffd35a" : "#ff5d68";
       ctx.fillRect(bx, by, bw * t, bh);
-    }
-    if (!falling && (e.slow || e.weak)) {
-      const marks = [];
-      if (e.slow) marks.push([ "❄", "#d9f3ff" ]);
-      if (e.weak) marks.push([ "◉", "#f4d5ff" ]);
-      const step = 28, bw = marks.length * step + 10, gy = s.y - 172;
-      ctx.fillStyle = "rgba(14,16,22,.72)";
-      roundRect(s.x - bw / 2, gy - 20, bw, 28, 9);
-      ctx.fill();
-      ctx.textAlign = "center";
-      ctx.font = "19px sans-serif";
-      marks.forEach(([ch, col], i) => {
-        const mx = s.x - bw / 2 + 10 + i * step + step / 2 - 5;
-        ctx.fillStyle = col;
-        ctx.fillText(ch, mx, gy);
-      });
     }
   }
   function drawEnemy(e) {
@@ -1946,15 +1955,14 @@
     ctx.save();
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    const col = COLORS[t.color].key;
-    const alpha = clamp(t.life / 1.4, 0, 1);
+    const col = COLORS[t.color].key, alpha = clamp(t.life / 1.4, 0, 1), b = t.brush || 1;
     if (t.color === 5) {
       drawIndigoTrail(t, col, alpha);
       ctx.restore();
       return;
     }
     ctx.strokeStyle = hexA(col, .18 * alpha);
-    ctx.lineWidth = t.color === 0 ? 23 : 19;
+    ctx.lineWidth = (t.color === 0 ? 23 : 19) * b;
     ctx.beginPath();
     t.points.forEach((p, i) => {
       let s = worldToScreen(p.x, p.y);
@@ -1962,7 +1970,7 @@
     });
     ctx.stroke();
     ctx.strokeStyle = hexA(col, .92 * alpha);
-    ctx.lineWidth = t.color === 0 ? 10 : 7;
+    ctx.lineWidth = (t.color === 0 ? 10 : 7) * b;
     ctx.beginPath();
     t.points.forEach((p, i) => {
       let s = worldToScreen(p.x, p.y);
@@ -1972,7 +1980,7 @@
     ctx.restore();
   }
   function drawIndigoTrail(t, col, alpha) {
-    const pts = t.points, max = t.blockMax || 1;
+    const pts = t.points, max = t.blockMax || 1, b = t.brush || 1;
     let i = 1;
     while (i < pts.length) {
       const h = indigoSegHp(t, i - 1) || 0;
@@ -1989,14 +1997,14 @@
         k === i - 1 ? ctx.moveTo(s.x, s.y) : ctx.lineTo(s.x, s.y);
       }
       ctx.strokeStyle = hexA(col, .18 * f);
-      ctx.lineWidth = 19;
+      ctx.lineWidth = 19 * b;
       ctx.stroke();
       ctx.strokeStyle = hexA(col, .92 * f);
-      ctx.lineWidth = 7;
+      ctx.lineWidth = 7 * b;
       ctx.stroke();
-      ctx.setLineDash([ 7, 7 ]);
+      ctx.setLineDash([ 7 * b, 7 * b ]);
       ctx.strokeStyle = hexA("#dce3ff", .8 * f);
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2 * b;
       ctx.stroke();
       ctx.setLineDash([]);
       i = j + 1;
@@ -2031,12 +2039,10 @@
   function drawPickup(p) {
     let s = worldToScreen(p.x, p.y);
     if (p.type === "xp") {
-      const R = 4;
-      const col = p.v < 5 ? "#62c7ff" : p.v < 8 ? "#3fd6c9" : p.v < 13 ? "#a97bff" : p.v < 22 ? "#ffd35a" : "#ff6fd8";
-      shadow(s, R + 1, .1);
-      ctx.fillStyle = col;
+      shadow(s, 5, .1);
+      ctx.fillStyle = "#62c7ff";
       ctx.beginPath();
-      ctx.arc(s.x, s.y - 5, R, 0, TAU);
+      ctx.arc(s.x, s.y - 5, 4, 0, TAU);
       ctx.fill();
     } else if (p.type === "heart") {
       shadow(s, 11, .1);
@@ -2049,6 +2055,18 @@
       ctx.arc(hx + R * .52, hy - R * .34, R * .62, 0, TAU);
       ctx.fill();
       poly([ [ hx - R * 1.1, hy - R * .18 ], [ hx + R * 1.1, hy - R * .18 ], [ hx, hy + R * 1.25 ] ], "#ff5d78");
+    } else if (p.type === "magnet") {
+      shadow(s, 11, .1);
+      ctx.strokeStyle = "#7ee7ff";
+      ctx.lineWidth = 5;
+      ctx.lineCap = "butt";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y - 7, 8, 0, Math.PI);
+      ctx.stroke();
+      ctx.fillStyle = "#ff596d";
+      ctx.fillRect(s.x - 10, s.y - 9, 5, 7);
+      ctx.fillStyle = "#e8f7ff";
+      ctx.fillRect(s.x + 5, s.y - 9, 5, 7);
     } else {
       shadow(s, 13, .1);
       drawRainbowIcon(s.x, s.y + 1);
@@ -2194,7 +2212,7 @@
     }
   }
   function drawConfetti() {
-    const exitFade = menuCloseAt >= 0 ? 1 - clamp((performance.now() - menuCloseAt) / 1e3 / MENU_OUT, 0, 1) : 1;
+    const exitFade = menuCloseAt >= 0 ? 1 - clamp((performance.now() - menuCloseAt) / MENU_OUT, 0, 1) : 1;
     confetti.forEach(p => {
       const a = clamp((H - p.y) / 70, 0, 1) * exitFade;
       ctx.save();
@@ -2269,13 +2287,15 @@
       ctx.fillText(String(i + 1), cx + i * gap, cy + 27);
     }
     if (started) drawHint();
+    drawBossDefeated();
     if (!started) drawStart();
     if (levelChoices.length) drawUpgradeMenu();
     if (dead) drawDeath();
     drawConfetti();
+    drawRestartConfirm();
   }
   const fmtTime = t => `${t / 60 | 0}:${("" + (100 + t % 60 | 0)).slice(1)}`;
-  const HINT = [ "WASD move", "Hold Space sprint", "Hold LMB draw", "1–7 / wheel change color", "R restart" ];
+  const HINT = [ "WASD - Move", "Space (Hold) - Sprint", "Mouse (Hold) - Draw", "1–7 / Scroll - Change Color", "R - Restart" ];
   function drawHint() {
     ctx.font = "11px system-ui";
     ctx.textAlign = "left";
@@ -2329,24 +2349,23 @@
     ctx.fillText(text, center ? x + w / 2 : x + 7, y + h - 3);
   }
   function drawCardIcon(kind, cx, cy, r, color) {
-    const G = (n, rot = 0, k = .8) => poly(ngon(r * k, n, rot).map(([x, y]) => [ cx + x, cy + y ]), color);
-    if (!kind) {
+    if (!kind || kind === 6) {
       ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.arc(cx, cy, r * .62, 0, TAU);
+      ctx.arc(cx, cy, r * (kind ? .9 : .62), 0, TAU);
       ctx.fill();
-    } else if (kind === 1) G(3, Math.PI / 2); else if (kind === 2) drawPlusIcon(cx, cy, r, color); else if (kind === 3) drawWindIcon(cx, cy, r, color); else if (kind === 4) drawRainbowIcon(cx, cy + 5, r * .85, r * .2); else if (kind === 5) {
+    } else if (kind === 1) poly(ngon(r * .8, 3, Math.PI / 2).map(([x, y]) => [ cx + x, cy + y ]), color); else if (kind === 2) drawPlusIcon(cx, cy, r, color); else if (kind === 3) drawWindIcon(cx, cy, r, color); else if (kind === 4) drawRainbowIcon(cx, cy + 5, r * .85, r * .2); else if (kind === 5) {
       ctx.strokeStyle = color;
       ctx.lineWidth = 4;
       ctx.beginPath();
       ctx.arc(cx, cy, r * .62, 0, TAU);
       ctx.stroke();
-    } else G(6, Math.PI / 6);
+    }
   }
   function menuPhase() {
-    if (menuCloseAt >= 0) return 1 - clamp((performance.now() - menuCloseAt) / 1e3 / MENU_OUT, 0, 1);
+    if (menuCloseAt >= 0) return 1 - clamp((performance.now() - menuCloseAt) / MENU_OUT, 0, 1);
     if (menuOpenAt < 0) return 1;
-    return clamp((performance.now() - menuOpenAt) / 1e3 / MENU_IN, 0, 1);
+    return clamp((performance.now() - menuOpenAt) / MENU_IN, 0, 1);
   }
   const easeOut = q => 1 - (1 - q) * (1 - q) * (1 - q);
   function drawUpgradeMenu() {
@@ -2365,7 +2384,7 @@
     ctx.globalAlpha = q * clamp(raw * 1.6 - .4, 0, 1);
     ctx.font = "14px system-ui";
     ctx.fillStyle = "#cfd4df";
-    ctx.fillText("Choose an upgrade — press 1, 2 or 3", W / 2, titleY + 28);
+    ctx.fillText("Choose an upgrade — click a card or press 1, 2 or 3", W / 2, titleY + 28);
     ctx.restore();
     const cw = 200, ch = 152, gap = 15, y0 = H * .37;
     levelChoices.forEach((u, i) => {
@@ -2429,6 +2448,24 @@
     ctx.font = "700 20px system-ui";
     ctx.fillText("Click to start", W / 2, H * .88);
   }
+  function drawBossDefeated() {
+    if (performance.now() > bossDefeatUntil) return;
+    const w = 430, h = 68, x = W / 2 - w / 2, y = 54;
+    ctx.fillStyle = "rgba(10,12,18,.9)";
+    roundRect(x, y, w, h, 12);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.18)";
+    ctx.lineWidth = 1;
+    roundRect(x, y, w, h, 12);
+    ctx.stroke();
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.font = "700 20px system-ui";
+    ctx.fillText("BOSS DEFEATED", W / 2, y + 26);
+    ctx.fillStyle = "rgba(255,255,255,.78)";
+    ctx.font = "13px system-ui";
+    ctx.fillText("Keep going and see how long you can survive!", W / 2, y + 49);
+  }
   function drawDeath() {
     ctx.fillStyle = "rgba(10,12,18,.72)";
     ctx.fillRect(0, 0, W, H);
@@ -2439,6 +2476,21 @@
     ctx.font = "16px system-ui";
     ctx.fillText(`Level ${player.level} · ${killCount} Kills`, W / 2, H * .42 + 34);
     ctx.fillText("Press R to restart", W / 2, H * .42 + 66);
+  }
+  function drawRestartConfirm() {
+    if (dead || performance.now() > restartConfirmUntil) return;
+    const w = 210, h = 34, x = W / 2 - w / 2, y = H - 54;
+    ctx.fillStyle = "rgba(10,12,18,.88)";
+    roundRect(x, y, w, h, 10);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.18)";
+    ctx.lineWidth = 1;
+    roundRect(x, y, w, h, 10);
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "700 14px system-ui";
+    ctx.fillText("Press R again to restart", W / 2, y + 22);
   }
   function render() {
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
