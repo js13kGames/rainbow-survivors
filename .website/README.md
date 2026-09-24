@@ -1,4 +1,8 @@
 ---
+genres:
+  - roguelike
+  - action
+  - survival
 directors_cut: https://redyagames.itch.io/rainbow-survivors
 # See github.com/js13kGames/hello-world for supported frontmatter
 ---
